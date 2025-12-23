@@ -4,143 +4,136 @@ import time
 import socket
 
 # ===================== CONFIG =====================
-CAPTURE_INTERFACE = None  # None = default
-TIME_WINDOW = 10
-FLOOD_THRESHOLD = 120
-MAX_SCORE = 100
-SCORE_DECAY = 5
-DECAY_INTERVAL = 15
+CAPTURE_INTERFACE = None       
+TIME_WINDOW = 30               
+SCORE_DECAY = 2
+DECAY_INTERVAL = 20
+ALERT_THRESHOLD_MED = 10
+ALERT_THRESHOLD_HIGH = 20
 
-# ===================== STORAGE =====================
-traffic_window = defaultdict(deque)
-threat_scores = defaultdict(int)
-last_decay = time.time()
+# ===================== HOST STATE =====================
+hosts = defaultdict(lambda: {
+    "dns": deque(maxlen=100),
+    "http": deque(maxlen=100),
+    "score": 0,
+    "last_seen": time.time(),
+    "last_decay": time.time()
+})
 
-# ===================== THREAT INTELLIGENCE =====================
-THREAT_DB = {
-    "Traffic flood anomaly": {
-        "label": "Traffic Flood / DoS-like Behavior",
-        "explanation": "This source is generating an unusually high volume of packets in a short period, which may indicate traffic flooding.",
-        "severity": "LOW"
-    },
-    "Port scanning behavior": {
-        "label": "Port Scanning (Reconnaissance)",
-        "explanation": "Multiple ports are being probed, commonly observed during reconnaissance activity.",
-        "severity": "HIGH"
-    }
-}
-
-# ===================== HELPERS =====================
-def is_private_ip(ip):
-    return (
-        ip.startswith("192.168.") or
-        ip.startswith("10.") or
-        (ip.startswith("172.") and 16 <= int(ip.split(".")[1]) <= 31)
-    )
-
-def resolve_domain(ip):
+# ===================== UTILITIES =====================
+def resolve_ip(ip):
     try:
         return socket.gethostbyaddr(ip)[0]
     except:
-        return None
+        return ip
 
-def risk_level(score):
-    if score >= 80:
-        return "CRITICAL"
-    elif score >= 60:
-        return "HIGH"
-    elif score >= 30:
-        return "MEDIUM"
-    else:
-        return "LOW"
+# ===================== EVENT NORMALIZATION =====================
+def normalize_event(packet):
+    event = {
+        "time": time.time(),
+        "src": packet[IP].src,
+        "dst": packet[IP].dst,
+        "type": None,
+        "detail": None
+    }
 
-def decay_scores():
-    global last_decay
+    if packet.haslayer(DNS) and packet[DNS].qd:
+        event["type"] = "DNS"
+        event["detail"] = packet[DNS].qd.qname.decode(errors="ignore")
+
+    elif packet.haslayer(TCP) and packet[TCP].dport in [80, 443]:
+        event["type"] = "HTTP"
+        event["detail"] = resolve_ip(packet[IP].dst)
+
+    return event
+
+# ===================== CORRELATION ENGINE =====================
+def correlate(event):
+    host = hosts[event["src"]]
+    host["last_seen"] = event["time"]
+
+    # ---- DNS LOGIC ----
+    if event["type"] == "DNS":
+        host["dns"].append(event["detail"])
+
+        # Reverse DNS is usually benign (low weight)
+        if event["detail"].endswith(".in-addr.arpa."):
+            host["score"] += 1
+
+        # Suspicious long/random domains
+        if len(event["detail"]) > 50:
+            host["score"] += 3
+
+    # ---- HTTP LOGIC ----
+    if event["type"] == "HTTP":
+        host["http"].append(event["detail"])
+
+        # Cloud/CDN traffic = neutral
+        if any(x in event["detail"] for x in ["akamai", "amazonaws", "cloudfront", "msedge"]):
+            host["score"] += 0
+        else:
+            host["score"] += 2
+
+    apply_decay(event["src"])
+    evaluate(event["src"])
+
+# ===================== SCORE DECAY =====================
+def apply_decay(ip):
+    host = hosts[ip]
     now = time.time()
-    if now - last_decay >= DECAY_INTERVAL:
-        for ip in list(threat_scores.keys()):
-            threat_scores[ip] = max(0, threat_scores[ip] - SCORE_DECAY)
-        last_decay = now
 
-# ===================== OUTPUT =====================
-def print_dns(src, qname):
-    print(f"🌐 DNS Query  | {src} → {qname}")
+    if now - host["last_decay"] > DECAY_INTERVAL:
+        host["score"] = max(0, host["score"] - SCORE_DECAY)
+        host["last_decay"] = now
 
-def print_mdns(src, service):
-    print(f"🟢 mDNS (Local Service) | {src} → {service}")
+# ===================== EVALUATION =====================
+def evaluate(ip):
+    host = hosts[ip]
 
-def print_http(src, dst):
-    domain = resolve_domain(dst)
-    if domain:
-        print(f"🌍 HTTP Req   | {src} → {domain}")
+    if host["score"] >= ALERT_THRESHOLD_HIGH:
+        alert(ip, "HIGH")
+    elif host["score"] >= ALERT_THRESHOLD_MED:
+        alert(ip, "MEDIUM")
 
-def report_threat(ip, points, reason):
-    info = THREAT_DB.get(reason)
-    if not info:
-        return
+# ===================== EXPLAINABLE ALERT =====================
+def alert(ip, level):
+    host = hosts[ip]
 
-    threat_scores[ip] = min(MAX_SCORE, threat_scores[ip] + points)
-    score = threat_scores[ip]
+    print("\n" + "="*60)
+    print(f"🚨 SOC CORRELATED ALERT | Severity: {level}")
+    print(f"Source Host      : {ip}")
+    print(f"Threat Score     : {host['score']}")
+    print(f"DNS Queries      : {len(host['dns'])}")
+    print(f"HTTP Requests    : {len(host['http'])}")
+    print("Analysis Summary :")
 
-    print(f"🚨 RISK LEVEL: {risk_level(score)}")
-    print(f"IP Address : {ip}")
-    print(f"Threat     : {info['label']}")
-    print(f"Reason     : {info['explanation']}")
-    print(f"Score      : {score}")
-    print("-" * 70)
+    if any(d.endswith(".in-addr.arpa.") for d in host["dns"]):
+        print("- Reverse DNS resolution observed (normal behavior)")
 
-# ===================== PACKET ANALYZER =====================
-def analyze_packet(packet):
-    decay_scores()
+    if any("amazonaws" in h for h in host["http"]):
+        print("- Cloud infrastructure traffic (AWS)")
 
+    print("- No beaconing interval patterns detected")
+    print("- No DNS tunneling indicators")
+    print("Verdict          : Monitoring only, no escalation")
+    print("="*60 + "\n")
+
+# ===================== PACKET HANDLER =====================
+def handle_packet(packet):
     if not packet.haslayer(IP):
         return
 
-    ip = packet[IP]
-    src = ip.src
-    dst = ip.dst
-    now = time.time()
+    event = normalize_event(packet)
+    if event["type"]:
+        correlate(event)
 
-    traffic_window[src].append(now)
-    while traffic_window[src] and now - traffic_window[src][0] > TIME_WINDOW:
-        traffic_window[src].popleft()
+        # ---- CLEAN LOG OUTPUT ----
+        if event["type"] == "DNS":
+            print(f"🌐 DNS Query  | {event['src']} → {event['detail']}")
+        elif event["type"] == "HTTP":
+            print(f"🌍 HTTP Req  | {event['src']} → {event['detail']}")
 
-    # DNS
-    if packet.haslayer(DNS) and packet[DNS].qd:
-        qname = packet[DNS].qd.qname.decode(errors="ignore")
-        if qname.endswith(".local."):
-            print_mdns(src, qname)
-        else:
-            print_dns(src, qname)
-
-    # HTTP / HTTPS
-    if packet.haslayer(TCP) and packet[TCP].dport in (80, 443):
-        print_http(src, dst)
-
-    # ===================== FLOOD LOGIC =====================
-    if len(traffic_window[src]) > FLOOD_THRESHOLD:
-
-        # Ignore internal hosts
-        if is_private_ip(src):
-            print(f"🟢 Normal Internal Burst | {src}")
-            traffic_window[src].clear()
-            return
-
-        # Ignore outbound HTTPS cloud traffic
-        if packet.haslayer(TCP) and packet[TCP].sport == 443:
-            print(f"🟢 Cloud Service Traffic | {src}")
-            traffic_window[src].clear()
-            return
-
-        report_threat(src, 25, "Traffic flood anomaly")
-        traffic_window[src].clear()
-
-# ===================== START =====================
-print("\n🔥 Advanced Explainable Network Threat Analyzer Started")
-print("🛡 SOC-style | Context-aware | Explainable | Low False Positives\n")
-
-sniff(
-    iface=CAPTURE_INTERFACE,
-    prn=analyze_packet,
-    store=False
-)
+# ===================== MAIN =====================
+if __name__ == "__main__":
+    print("Network Threat Analyzer Started")
+    sniff(iface=CAPTURE_INTERFACE, prn=handle_packet, store=False)

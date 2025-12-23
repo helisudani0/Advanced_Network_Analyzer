@@ -67,7 +67,7 @@ def correlate(event):
             host["score"] += 1
 
         elif len(event["detail"]) > 50:
-            host["score"] += 3
+            host["score"] += 2
 
     # ---- HTTP LOGIC ----
     elif event["type"] == "HTTP":
@@ -79,7 +79,7 @@ def correlate(event):
         ]):
             pass
         else:
-            host["score"] += 2
+            host["score"] += 1
 
     host["score"] = min(MAX_SCORE, host["score"])
     apply_decay(event["src"])
@@ -106,7 +106,7 @@ def evaluate(ip):
     else:
         new_sev = "LOW"
 
-    # 🔥 ALERT ONLY ON SEVERITY ESCALATION
+    #ALERT ONLY ON SEVERITY ESCALATION
     if severity_rank(new_sev) > severity_rank(host["severity"]):
         if now - host["last_alert"] >= ALERT_COOLDOWN:
             alert(ip, new_sev)
@@ -121,7 +121,7 @@ def alert(ip, level):
     host = hosts[ip]
 
     print("\n" + "="*60)
-    print(f"🚨 SOC CORRELATED ALERT | Severity: {level}")
+    print(f"SOC CORRELATED ALERT | Severity: {level}")
     print(f"Source Host      : {ip}")
     print(f"Threat Score     : {host['score']}")
     print(f"DNS Queries      : {len(host['dns'])}")
@@ -148,9 +148,9 @@ def handle_packet(packet):
     correlate(event)
 
     if event["type"] == "DNS":
-        print(f"🌐 DNS Query  | {event['src']} → {event['detail']}")
+        print(f"DNS Query  | {event['src']} → {event['detail']}")
     elif event["type"] == "HTTP":
-        print(f"🌍 HTTP Req  | {event['src']} → {event['detail']}")
+        print(f"HTTP Req  | {event['src']} → {event['detail']}")
 
 # ===================== MAIN =====================
 if __name__ == "__main__":

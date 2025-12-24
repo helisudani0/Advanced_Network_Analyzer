@@ -121,7 +121,7 @@ def correlate(event):
         if detail.endswith(".in-addr.arpa."):
             host["score"] += 1
         elif len(detail) > 50:
-            host["score"] += 3
+            host["score"] += 2
 
     elif etype == "HTTP":
         host["http"].append(detail)
@@ -129,7 +129,7 @@ def correlate(event):
             "google", "akamai", "amazonaws",
             "cloudfront", "windowsupdate"
         ]):
-            host["score"] += 2
+            host["score"] += 1
 
     host["score"] = min(MAX_SCORE, host["score"])
     decay(src)

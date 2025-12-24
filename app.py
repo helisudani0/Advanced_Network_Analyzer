@@ -28,7 +28,7 @@ hosts = defaultdict(lambda: {
 
 # ===================== GUI SETUP =====================
 root = tk.Tk()
-root.title("🛡 SOC Network Threat Analyzer")
+root.title("Network Threat Analyzer")
 root.geometry("1100x600")
 root.configure(bg="#0f172a")
 
@@ -168,7 +168,7 @@ def raise_alert(ip, level):
     h = hosts[ip]
 
     log_alert("="*55, color)
-    log_alert(f"🚨 {level} ALERT", color)
+    log_alert(f" {level} ALERT", color)
     log_alert(f"Host: {ip}", color)
     log_alert(f"Score: {h['score']}", color)
     log_alert(f"DNS: {len(h['dns'])} | HTTP: {len(h['http'])}", color)
@@ -185,9 +185,9 @@ def handle(packet):
     correlate(event)
 
     if etype == "DNS":
-        log_event(f"🌐 DNS  {src} → {detail}", "cyan")
+        log_event(f"DNS  {src} → {detail}", "cyan")
     else:
-        log_event(f"🌍 HTTP {src} → {detail}", "lightgreen")
+        log_event(f"HTTP {src} → {detail}", "lightgreen")
 
 # ===================== THREAD =====================
 def sniff_thread():

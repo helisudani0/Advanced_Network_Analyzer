@@ -1,0 +1,14 @@
+﻿# Legacy Python analyzer compatibility dependencies.
+# The new Ravynel Go/Rust product spine does not require Python packages.
+scapy
+geoip2
+cryptography
+fastapi
+uvicorn
+reportlab
+scikit-learn
+psycopg[binary]
+sqlalchemy
+dpkt
+pyshark
+tensorflow; python_version < "3.13"

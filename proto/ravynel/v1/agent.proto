@@ -1,0 +1,34 @@
+﻿syntax = "proto3";
+
+package ravynel.v1;
+
+option go_package = "ravynel-control-plane/gen/ravynel/v1;ravynelv1";
+
+service AgentService {
+  rpc RegisterAgent(RegisterAgentRequest) returns (RegisterAgentResponse);
+  rpc StreamTelemetry(stream TelemetryEvent) returns (TelemetryAck);
+}
+
+message RegisterAgentRequest {
+  string agent_id = 1;
+  string hostname = 2;
+  string version = 3;
+}
+
+message RegisterAgentResponse {
+  string status = 1;
+  string collector_id = 2;
+}
+
+message TelemetryEvent {
+  string agent_id = 1;
+  int64 timestamp = 2;
+  string source = 3;
+  string destination = 4;
+  string protocol = 5;
+  uint64 bytes = 6;
+}
+
+message TelemetryAck {
+  uint64 accepted = 1;
+}

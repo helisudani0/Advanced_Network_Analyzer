@@ -1,0 +1,11 @@
+{
+  "quick_filter": "all",
+  "high_risk_countries": ["RU", "KP"],
+  "worker_count": 2,
+  "dns_tunnel_query_threshold": 35,
+  "horizontal_port_threshold": 30,
+  "vertical_host_threshold": 25,
+  "exfil_bytes_medium": 1800000,
+  "exfil_bytes_high": 6000000,
+  "ioc_sources": ["feeds/threat_iocs.csv"]
+}

@@ -1,0 +1,33 @@
+name: publish-release-assets
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish, for example v0.1.0"
+        required: true
+        default: "v0.1.0"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build release assets
+        run: python scripts/package_release.py --no-public-copy
+      - name: Publish assets to GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          gh release view "$TAG_NAME" >/dev/null 2>&1 || gh release create "$TAG_NAME" --title "Ravynel $TAG_NAME" --generate-notes
+          gh release upload "$TAG_NAME" dist/Ravynel-Windows-Launcher.zip dist/ravynel-sensor-linux-install.sh dist/ravynel-kubernetes-control-plane.yaml dist/checksums.txt --clobber

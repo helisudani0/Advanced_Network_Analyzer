@@ -1,0 +1,5 @@
+[workspace]
+members = [
+  "engines/agent-core"
+]
+resolver = "2"

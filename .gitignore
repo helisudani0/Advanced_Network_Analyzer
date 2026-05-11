@@ -1,42 +1,97 @@
-﻿__pycache__/
-*.pyc
+# Python caches and local environments
+__pycache__/
+*.py[cod]
 *.pyo
 *.pyd
-*.exe
+.pytest_cache/
+.venv/
+venv/
+env/
+ENV/
 
-analyzer.db
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
 app_settings.json
+*.secret
+*.secrets
+secrets/
+private/
+*.pem
+*.key
+*.crt
+*.cer
+*.pfx
+*.p12
+
+# Databases and local telemetry stores
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite3-shm
+*.sqlite3-wal
+
+# Captures, uploads, reports, and generated evidence
 reports/
-downloads/
+logs/
 uploads/
+downloads/
 data/
+artifacts/
+captures/
+sessions/
+*.pcap
+*.pcapng
+*.cap
+*.etl
+*.evtx
+*.mmdb
+GeoLite2-*.mmdb
+
+# Release and installer outputs
+dist/
+*.zip
+*.msi
+*.exe
+*.pkg
+*.dmg
 
 # Rust / Go build output
 target/
 bin/
 coverage.out
+*.prof
+*.test
 
-# local validation scratch
-temp_*.db
-temp_*.json
-temp_*/
-.tmp_*/
-
-.pytest_cache/
 # JavaScript / Next.js
 node_modules/
 .next/
 apps/*/.next/
 apps/*/out/
+*.tsbuildinfo
 
-# local package manager and build caches
+# Local package manager and build caches
 .tmp_npm_cache/
 .tmp_go_cache/
 .tmp_go_mod/
 .tmp_gopath/
 
-# TypeScript incremental state
-*.tsbuildinfo
-logs/
+# Local validation scratch
+temp_*.db
+temp_*.json
+temp_*/
+.tmp_*/
 
-
+# OS/editor noise
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo

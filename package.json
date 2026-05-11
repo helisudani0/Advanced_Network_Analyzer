@@ -1,0 +1,43 @@
+{
+  "name": "ravynel-security-platform",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Enterprise SOC network detection and response platform.",
+  "scripts": {
+    "dev:site": "next dev apps/marketing -H 0.0.0.0 -p 3000",
+    "dev:marketing": "next dev apps/marketing -H 0.0.0.0 -p 3000",
+    "dev:site:local": "next dev apps/marketing -p 3000",
+    "build:site": "next build apps/marketing",
+    "build:marketing": "next build apps/marketing",
+    "typecheck": "tsc -p apps/marketing/tsconfig.json --noEmit",
+    "dev:app": "python app.py dashboard",
+    "dev:app:historical": "python app.py dashboard --historical"
+  },
+  "workspaces": [
+    "apps/marketing"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "autoprefixer": "latest",
+    "eslint": "latest",
+    "eslint-config-next": "latest",
+    "postcss": "latest",
+    "tailwindcss": "^3.4.17",
+    "typescript": "latest"
+  },
+  "dependencies": {
+    "@radix-ui/react-slot": "latest",
+    "class-variance-authority": "latest",
+    "clsx": "latest",
+    "lucide-react": "latest",
+    "next": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "tailwind-merge": "latest"
+  }
+}

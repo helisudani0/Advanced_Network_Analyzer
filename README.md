@@ -1,83 +1,95 @@
 # Ravynel Security Launch Guide
 
-Ravynel Security is a live network threat detection platform for packet capture, protocol analysis, host/session visibility, alert triage, asset baselining, and PDF investigation reporting.
+Ravynel Security is an enterprise-style network detection and response platform for live packet capture, protocol analysis, host/session visibility, alert triage, asset baselining, and PDF investigation reporting.
 
 Developed by: [HeliSudani](https://helisudani0.github.io/Heli_Sudani-Portfolio/)
 
-## Product Surfaces
+## Public Launch Model
 
-| Surface | Purpose | Default URL |
+| Surface | Hosted on | Purpose |
 | --- | --- | --- |
-| Product site | Public overview, docs, release notes, support, and downloads | `http://localhost:3000` during website development |
-| Ravynel app | Installed/local analyst console for live capture, detections, assets, reports, and settings | Opened automatically by the launcher |
+| Product site | GitHub Pages | Public overview, documentation, release notes, support, and download links |
+| Download assets | GitHub Releases | Windows launcher ZIP, Linux bootstrap, Kubernetes manifest, checksums |
+| Ravynel app | User machine / internal network | Local analyst console for capture, detections, assets, sessions, reports, and settings |
 
-The product site is not required to use the app. Downloaded users launch the Ravynel app directly.
+The product site does not run capture. Users download a release package, launch the desktop GUI, and the GUI starts the local analyzer.
 
-## Start The App
+## Build Release Downloads
+
+```powershell
+python scripts\package_release.py
+```
+
+This creates:
+
+```text
+dist/Ravynel-Windows-Launcher.zip
+dist/ravynel-sensor-linux-install.sh
+dist/ravynel-kubernetes-control-plane.yaml
+dist/checksums.txt
+```
+
+The Windows ZIP includes the GUI launcher, analyzer engine, profiles, feeds, requirements, and first-run setup notes.
+
+## Deploy Product Site On GitHub
+
+GitHub Actions includes:
+
+```text
+.github/workflows/pages.yml
+.github/workflows/release.yml
+```
+
+Recommended release flow:
+
+```powershell
+git tag v0.1.0
+git push origin main --tags
+```
+
+The release workflow uploads downloadable assets to GitHub Releases. The product site download buttons point to:
+
+```text
+https://github.com/<owner>/<repo>/releases/latest/download/<asset-name>
+```
+
+## Windows First Run
+
+1. Install Python 3.12+.
+2. Install Npcap for live packet capture.
+3. Extract `Ravynel-Windows-Launcher.zip`.
+4. Run `python -m pip install -r requirements.txt` inside the extracted folder.
+5. Double-click `Ravynel-Launch.pyw`.
+6. Press Start in the GUI.
+
+If packet capture is blocked, run the launcher as Administrator. For full LAN visibility, deploy Ravynel at a gateway, SPAN/TAP mirror, or distributed sensor. A normal laptop adapter only sees traffic visible to that adapter.
+
+## Local Development
+
+Start the app:
 
 ```powershell
 .\scripts\start-ravynel.ps1
 ```
 
-The launcher chooses a free local API port, starts the analyzer in the background, waits for it to become ready, and opens the clean app GUI in your browser. Logs are written to `logs/app.out.log` and `logs/app.err.log`.
-
-If you need to see logs immediately:
-
-```powershell
-.\scripts\start-ravynel.ps1 -ShowLogs
-```
-
-Manual terminal launch:
-
-```powershell
-python app.py dashboard
-```
-
-## Start The Product Site For Development
+Start the product site:
 
 ```powershell
 npm run dev:site
 ```
 
-Open:
-
-```text
-http://localhost:3000
-```
-
-## Live Packet Capture
-
-You do not type an IP range for live packet capture. Ravynel monitors the selected local adapter or the default packet-capture adapter.
-
-Examples:
-
-```powershell
-python app.py dashboard
-python app.py dashboard --iface Ethernet
-python app.py dashboard --iface Wi-Fi --bpf-filter "tcp or udp"
-```
-
-A normal laptop Wi-Fi/Ethernet adapter sees traffic visible to that adapter. For full enterprise LAN visibility, deploy a gateway sensor, SPAN/TAP capture point, or distributed Ravynel sensors.
-
-## Reports
-
-Reports are generated from real captured or replayed telemetry and saved as PDFs in `reports/`.
-
-```powershell
-python app.py report
-```
-
 ## Validation
 
 ```powershell
+python scripts\package_release.py
 npm run typecheck
 npm run build:site
 cargo test
 $env:GOCACHE=(Resolve-Path .).Path + '\.tmp_go_cache'; go test .\services\control-plane\...
 ```
 
-## Notes
+## Security Notes
 
-- Ravynel displays observed telemetry only.
-- Normal traffic may produce packets, sessions, hosts, and assets without producing alerts.
+- Verify `checksums.txt` before distributing release assets internally.
+- Unsigned script ZIPs may trigger Windows SmartScreen. Enterprise rollout should use signed EXE/MSI packages.
 - Scan or capture only networks you own or are explicitly authorized to assess.

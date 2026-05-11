@@ -1,0 +1,34 @@
+﻿apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ravynel-postgres
+spec:
+  serviceName: ravynel-postgres
+  replicas: 1
+  selector: { matchLabels: { app: ravynel-postgres } }
+  template:
+    metadata: { labels: { app: ravynel-postgres } }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports: [{ containerPort: 5432 }]
+          env:
+            - { name: POSTGRES_DB, value: ravynel }
+            - { name: POSTGRES_USER, value: ravynel }
+            - { name: POSTGRES_PASSWORD, valueFrom: { secretKeyRef: { name: ravynel-postgres, key: password } } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ravynel-redis
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: ravynel-redis } }
+  template:
+    metadata: { labels: { app: ravynel-redis } }
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          ports: [{ containerPort: 6379 }]

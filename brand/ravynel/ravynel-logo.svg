@@ -1,0 +1,13 @@
+﻿<svg xmlns="http://www.w3.org/2000/svg" width="720" height="220" viewBox="0 0 720 220" role="img" aria-labelledby="title desc">
+  <title id="title">Ravynel Security logo</title>
+  <desc id="desc">A premium enterprise SOC logo with a raven-wing signal mark and Ravynel wordmark.</desc>
+  <defs>
+    <linearGradient id="g" x1="35" x2="190" y1="25" y2="190" gradientUnits="userSpaceOnUse"><stop stop-color="#54D8FF"/><stop offset="1" stop-color="#FF8B61"/></linearGradient>
+  </defs>
+  <rect width="720" height="220" rx="34" fill="#07111C"/>
+  <path d="M64 115c35-60 78-78 129-56-39 9-65 31-78 67 22-12 48-14 79-5-37 16-69 34-96 56-5-29-16-49-34-62Z" fill="url(#g)"/>
+  <circle cx="145" cy="77" r="7" fill="#07111C"/>
+  <path d="M228 90h84M228 122h126M228 154h92" stroke="#54D8FF" stroke-width="4" stroke-linecap="round" opacity=".45"/>
+  <text x="228" y="92" font-family="Segoe UI, Aptos, sans-serif" font-size="58" font-weight="760" fill="#F2F8FC" letter-spacing="-2">Ravynel</text>
+  <text x="232" y="132" font-family="Segoe UI, Aptos, sans-serif" font-size="17" font-weight="700" fill="#8BB8C8" letter-spacing="4">SECURITY OPERATIONS</text>
+</svg>

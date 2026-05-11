@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 from pathlib import Path
@@ -29,7 +29,7 @@ def format_console_alert(alert: AlertRecord) -> str:
 def to_cef(alert: AlertRecord) -> str:
     reason_blob = " | ".join(alert.reasons)
     return (
-        "CEF:0|AdvancedNetworkAnalyzer|ThreatPlatform|1.0|"
+        "CEF:0|Ravynel|NDR|1.0|"
         f"{alert.classification}|{alert.title}|{SEVERITY_RANK.get(alert.severity, 1)}|"
         f"src={alert.host} dst={alert.destination} msg={reason_blob} "
         f"cs1Label=MITRE_Technique cs1={alert.mitre_technique} "

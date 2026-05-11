@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from typing import Dict, List, Optional
@@ -40,6 +40,8 @@ class PacketContext:
     http_user_agent: str = ""
     http_body_size: int = 0
     http_query_string: str = ""
+    http_status: str = ""
+    http_content_type: str = ""
     tls_version: str = ""
     tls_sni: str = ""
     tls_cert_subject: str = ""
@@ -50,8 +52,13 @@ class PacketContext:
     ttl: int = 0
     tcp_window: int = 0
     tcp_flags: int = 0
+    tcp_seq: int = 0
+    tcp_ack: int = 0
+    tcp_payload_len: int = 0
     session_id: str = ""
+    stream_direction: str = ""
     protocol_tags: List[str] = field(default_factory=list)
+    protocol_details: Dict[str, object] = field(default_factory=dict)
     ioc_matches: List[IOCMatch] = field(default_factory=list)
     risk_score: int = 0
     risk_factors: List[str] = field(default_factory=list)
@@ -118,8 +125,23 @@ class SessionRecord:
     last_seen: float
     packet_count: int = 0
     total_bytes: int = 0
+    client_payload_bytes: int = 0
+    server_payload_bytes: int = 0
     protocol_hints: List[str] = field(default_factory=list)
     snippets: List[str] = field(default_factory=list)
+    request_count: int = 0
+    response_count: int = 0
+    last_request_url: str = ""
+    last_http_status: str = ""
+    last_protocol_detail: str = ""
+    client_stream_path: str = ""
+    server_stream_path: str = ""
+    reconstructed_client_preview: str = ""
+    reconstructed_server_preview: str = ""
+    protocol_details: Dict[str, object] = field(default_factory=dict)
+    reassembly: Dict[str, object] = field(default_factory=dict)
+    artifacts: List[Dict[str, object]] = field(default_factory=list)
+    conversation_summary: str = ""
     extracted_artifact: str = ""
 
     def to_dict(self) -> Dict[str, object]:

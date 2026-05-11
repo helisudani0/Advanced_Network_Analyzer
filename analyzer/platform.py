@@ -12,14 +12,16 @@ import socket
 import statistics
 import threading
 import time
-from typing import Deque, Dict, Iterable, List, Optional, Tuple
+import traceback
+from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple
+from urllib.parse import urlparse
 
 from .config import PlatformConfig
 from .intel import ThreatIntelManager, normalize_domain
 from .models import AlertRecord, DetectionFinding, HostSnapshot, PacketContext, SessionRecord
 from .output import AlertRouter
 from .reporting import ReportGenerator
-from .storage import SQLiteStore
+from .storage import create_store
 
 try:
     from geoip2.database import Reader as GeoIPReader
@@ -27,18 +29,34 @@ except Exception:
     GeoIPReader = None
 
 try:
-    from scapy.all import DNS, IP, IPv6, PcapReader, Raw, TCP, UDP, sniff
+    from scapy.all import DNS, Ether, IP, IPv6, PcapReader, Raw, TCP, UDP, get_if_list, sniff
     SCAPY_IMPORT_ERROR = None
 except Exception as exc:
     DNS = None
+    Ether = None
     IP = None
     IPv6 = None
     PcapReader = None
     Raw = None
     TCP = None
     UDP = None
+    get_if_list = None
     sniff = None
     SCAPY_IMPORT_ERROR = exc
+
+try:
+    import dpkt
+    DPKT_IMPORT_ERROR = None
+except Exception as exc:
+    dpkt = None
+    DPKT_IMPORT_ERROR = exc
+
+try:
+    import pyshark
+    PYSHARK_IMPORT_ERROR = None
+except Exception as exc:
+    pyshark = None
+    PYSHARK_IMPORT_ERROR = exc
 
 try:
     from cryptography import x509
@@ -49,6 +67,19 @@ try:
     from sklearn.ensemble import IsolationForest
 except Exception:
     IsolationForest = None
+
+try:
+    import numpy as np
+    from tensorflow.keras.layers import Dense, LSTM
+    from tensorflow.keras.models import Sequential
+except Exception as exc:
+    np = None
+    Dense = None
+    LSTM = None
+    Sequential = None
+    TENSORFLOW_IMPORT_ERROR = exc
+else:
+    TENSORFLOW_IMPORT_ERROR = None
 
 
 HTTP_PORTS = {80, 8000, 8080, 8888}
@@ -62,6 +93,7 @@ SMB_PORTS = {139, 445}
 RDP_PORTS = {3389}
 LDAP_PORTS = {389, 636}
 KERBEROS_PORTS = {88}
+FTP_PORTS = {20, 21}
 TLS_VERSION_MAP = {
     0x0300: "SSLv3",
     0x0301: "TLS1.0",
@@ -111,6 +143,68 @@ SQLI_PATTERNS = (
 DIRECTORY_TRAVERSAL_PATTERNS = ("../", "..%2f", "%2e%2e/", "..\\")
 BASE64_BLOB_RE = re.compile(r"(?:[A-Za-z0-9+/]{80,}={0,2})")
 FILE_HINT_RE = re.compile(r"/[^?\s]+\.(zip|7z|rar|exe|dll|pdf|docx?|xlsx?|pptx?)", re.IGNORECASE)
+DOWNLOAD_CONTENT_TYPES = (
+    "application/zip",
+    "application/x-zip-compressed",
+    "application/octet-stream",
+    "application/pdf",
+    "application/msword",
+    "application/vnd",
+    "image/",
+    "audio/",
+    "video/",
+)
+SMB2_COMMANDS = {
+    0x0000: "NEGOTIATE",
+    0x0001: "SESSION_SETUP",
+    0x0003: "TREE_CONNECT",
+    0x0005: "CREATE",
+    0x0008: "READ",
+    0x0009: "WRITE",
+    0x000B: "IOCTL",
+    0x000D: "ECHO",
+}
+LDAP_OPERATION_TAGS = {
+    0x60: "bindRequest",
+    0x61: "bindResponse",
+    0x63: "searchRequest",
+    0x64: "searchResultEntry",
+    0x65: "searchResultDone",
+    0x66: "modifyRequest",
+    0x68: "addRequest",
+}
+KERBEROS_MESSAGE_TYPES = {
+    0x6A: "AS-REQ",
+    0x6B: "AS-REP",
+    0x6C: "TGS-REQ",
+    0x6D: "TGS-REP",
+    0x6E: "AP-REQ",
+    0x6F: "AP-REP",
+}
+SERVICE_PORT_LABELS = {
+    20: "ftp-data",
+    21: "ftp-control",
+    53: "dns",
+    80: "http",
+    88: "kerberos",
+    123: "ntp",
+    139: "netbios",
+    389: "ldap",
+    443: "https",
+    445: "smb",
+    636: "ldaps",
+    3389: "rdp",
+    5222: "xmpp",
+    5223: "xmpps",
+    5228: "push",
+    6667: "irc",
+    6881: "bittorrent",
+    8080: "web-alt",
+    8443: "https-alt",
+    51413: "bittorrent",
+}
+FTP_TRANSFER_TIMEOUT = 900
+KNOWN_SERVICE_PORTS = HTTP_PORTS | HTTPS_PORTS | DNS_PORTS | IRC_PORTS | P2P_PORTS | SMB_PORTS | RDP_PORTS | LDAP_PORTS | KERBEROS_PORTS | FTP_PORTS
 
 
 @dataclass
@@ -137,6 +231,10 @@ class HostState:
     baseline_protocols: Counter = field(default_factory=Counter)
     feature_samples: Deque[List[float]] = field(default_factory=lambda: deque(maxlen=512))
     interarrival_samples: Deque[float] = field(default_factory=lambda: deque(maxlen=256))
+    transition_counts: Dict[str, Counter] = field(default_factory=lambda: defaultdict(Counter))
+    transition_totals: Counter = field(default_factory=Counter)
+    sequence_tokens: Deque[str] = field(default_factory=lambda: deque(maxlen=512))
+    last_sequence_token: str = ""
     last_packet_time: float = 0.0
     last_seen: float = field(default_factory=time.time)
 
@@ -147,6 +245,72 @@ class FlowState:
     last_seen: float = 0.0
     last_sni: str = ""
     server_names: List[str] = field(default_factory=list)
+
+
+@dataclass
+class ReassemblyBuffer:
+    next_seq: Optional[int] = None
+    fragments: Dict[int, bytes] = field(default_factory=dict)
+    overlaps: int = 0
+    out_of_order: int = 0
+    contiguous_bytes: int = 0
+
+
+class LSTMSequenceModel:
+    def __init__(self):
+        self.model = None
+        self.token_to_id: Dict[str, int] = {}
+        self.last_train_count = 0
+        self.error = ""
+
+    @property
+    def available(self) -> bool:
+        return np is not None and Sequential is not None and LSTM is not None and Dense is not None
+
+    def _encode_token(self, token: str) -> int:
+        if token not in self.token_to_id:
+            self.token_to_id[token] = len(self.token_to_id)
+        return self.token_to_id[token]
+
+    def train(self, tokens: List[str], sequence_length: int, epochs: int = 2) -> None:
+        if not self.available:
+            self.error = f"TensorFlow/Keras unavailable: {TENSORFLOW_IMPORT_ERROR}"
+            return
+        encoded = [self._encode_token(token) for token in tokens if token]
+        vocab_size = max(2, len(self.token_to_id))
+        if len(encoded) <= sequence_length or vocab_size <= 1:
+            return
+        x_rows = []
+        y_rows = []
+        for index in range(sequence_length, len(encoded)):
+            x_rows.append(encoded[index - sequence_length:index])
+            y_rows.append(encoded[index])
+        x_train = np.array(x_rows, dtype="float32").reshape((len(x_rows), sequence_length, 1))
+        x_train = x_train / float(max(1, vocab_size - 1))
+        y_train = np.array(y_rows, dtype="int32")
+        model = Sequential()
+        model.add(LSTM(32, input_shape=(sequence_length, 1)))
+        model.add(Dense(vocab_size, activation="softmax"))
+        model.compile(optimizer="adam", loss="sparse_categorical_crossentropy")
+        model.fit(x_train, y_train, epochs=epochs, verbose=0)
+        self.model = model
+        self.last_train_count = len(encoded)
+        self.error = ""
+
+    def probability(self, previous_tokens: List[str], current_token: str, sequence_length: int) -> Optional[float]:
+        if not self.available or self.model is None or current_token not in self.token_to_id:
+            return None
+        if len(previous_tokens) < sequence_length:
+            return None
+        encoded = [self.token_to_id.get(token, 0) for token in previous_tokens[-sequence_length:]]
+        vocab_size = max(2, len(self.token_to_id))
+        x_value = np.array([encoded], dtype="float32").reshape((1, sequence_length, 1))
+        x_value = x_value / float(max(1, vocab_size - 1))
+        prediction = self.model.predict(x_value, verbose=0)[0]
+        token_id = self.token_to_id[current_token]
+        if token_id >= len(prediction):
+            return None
+        return float(prediction[token_id])
 
 
 def safe_decode(value: object) -> str:
@@ -241,14 +405,54 @@ def fingerprint_os(ttl: int, tcp_window: int) -> str:
 
 
 def transport_code(transport: str) -> int:
-    mapping = {"TCP": 1, "UDP": 2, "DNS": 3, "HTTP": 4, "HTTPS": 5, "TLS": 6}
+    mapping = {
+        "TCP": 1,
+        "UDP": 2,
+        "DNS": 3,
+        "HTTP": 4,
+        "HTTPS": 5,
+        "TLS": 6,
+        "FTP": 7,
+        "SMB": 8,
+        "RDP": 9,
+        "LDAP": 10,
+        "KERBEROS": 11,
+        "IRC": 12,
+        "P2P": 13,
+        "MDNS": 14,
+        "mDNS": 14,
+    }
     return mapping.get(transport, 0)
+
+
+def direction_code(direction: str) -> int:
+    mapping = {"outbound": 1, "inbound": 2, "internal": 3, "external": 4}
+    return mapping.get(direction, 0)
 
 
 def normalize_session_id(src_ip: str, src_port: int, dst_ip: str, dst_port: int, transport: str) -> str:
     endpoints = [(src_ip, src_port), (dst_ip, dst_port)]
     left, right = sorted(endpoints)
     return f"{left[0]}:{left[1]}-{right[0]}:{right[1]}-{transport}"
+
+
+def safe_path_fragment(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", value)
+
+
+def as_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def redact_connection_target(value: str) -> str:
+    if "://" in value and "@" in value:
+        prefix, tail = value.split("://", 1)
+        if "@" in tail:
+            _, host = tail.rsplit("@", 1)
+            return f"{prefix}://***@{host}"
+    return value
 
 
 def wildcard_match(name: str, pattern: str) -> bool:
@@ -290,6 +494,8 @@ def parse_http_payload(payload: bytes) -> Dict[str, object]:
             "is_response": True,
             "status": first_line,
             "headers": headers,
+            "content_type": headers.get("content-type", ""),
+            "content_disposition": headers.get("content-disposition", ""),
             "body_size": len(body.encode("utf-8", errors="ignore")),
             "body_preview": body[:512],
         }
@@ -313,6 +519,39 @@ def parse_http_payload(payload: bytes) -> Dict[str, object]:
         "body_size": len(body.encode("utf-8", errors="ignore")),
         "body_preview": body[:1024],
     }
+
+
+def parse_ftp_payload(payload: bytes) -> Dict[str, object]:
+    if not payload:
+        return {}
+    text = payload[:4096].decode("utf-8", errors="ignore").strip()
+    if not text:
+        return {}
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return {}
+    first_line = lines[0]
+    details: Dict[str, object] = {"preview": first_line[:220]}
+    if len(first_line) >= 3 and first_line[:3].isdigit():
+        details["is_response"] = True
+        details["status_code"] = first_line[:3]
+        details["message"] = first_line[4:220] if len(first_line) > 4 else ""
+        return details
+    command, _, argument = first_line.partition(" ")
+    command = command.upper()
+    if command not in {
+        "USER", "PASS", "CWD", "PWD", "LIST", "NLST", "RETR", "STOR", "DELE", "RNFR", "RNTO",
+        "PASV", "PORT", "EPSV", "TYPE", "SIZE", "SYST", "MKD", "RMD",
+    }:
+        return {}
+    details["is_response"] = False
+    details["command"] = command
+    details["argument"] = argument[:220]
+    if command in {"RETR", "STOR", "RNFR", "RNTO", "DELE"} and argument:
+        details["file_name"] = safe_path_fragment(Path(argument).name or argument)
+    if command == "USER" and argument:
+        details["username"] = argument[:120]
+    return details
 
 
 def parse_tls_client_hello(payload: bytes) -> Dict[str, object]:
@@ -397,11 +636,139 @@ def parse_tls_certificate(payload: bytes) -> Dict[str, object]:
         return {}
 
 
+def extract_printable_strings(payload: bytes, minimum: int = 5) -> List[str]:
+    text = safe_decode(payload)
+    return re.findall(rf"[A-Za-z0-9_./:\\\\@-]{{{minimum},}}", text)
+
+
+def parse_smb_payload(payload: bytes) -> Dict[str, object]:
+    details: Dict[str, object] = {}
+    if len(payload) >= 4 and payload[:4] == b"\xfeSMB":
+        details["dialect"] = "SMB2+"
+        if len(payload) >= 14:
+            command = int.from_bytes(payload[12:14], "little")
+            details["command"] = SMB2_COMMANDS.get(command, f"0x{command:04x}")
+    elif len(payload) >= 4 and payload[:4] == b"\xffSMB":
+        details["dialect"] = "SMB1"
+        if len(payload) >= 5:
+            details["command"] = f"0x{payload[4]:02x}"
+    elif b"NTLMSSP" not in payload.upper():
+        return {}
+
+    upper = payload.upper()
+    if b"NTLMSSP" in upper:
+        details["auth"] = "NTLMSSP"
+    share_paths = []
+    for token in extract_printable_strings(payload, minimum=6):
+        if token.startswith("\\\\") and token.count("\\") >= 2:
+            share_paths.append(token)
+    if share_paths:
+        details["shares"] = share_paths[:5]
+    return details
+
+
+def parse_rdp_payload(payload: bytes) -> Dict[str, object]:
+    details: Dict[str, object] = {}
+    preview = safe_decode(payload[:512])
+    upper = preview.upper()
+    if payload[:1] == b"\x03":
+        details["transport"] = "TPKT"
+    if "COOKIE: MSTSHASH=" in upper:
+        details["stage"] = "client-negotiation"
+        match = re.search(r"cookie:\s*mstshash=([^\r\n;]+)", preview, re.IGNORECASE)
+        if match:
+            details["client_name"] = match.group(1)
+    channels = []
+    if "RDPDR" in upper:
+        channels.append("rdpdr")
+    if "CLIPRDR" in upper:
+        channels.append("cliprdr")
+    if channels:
+        details["virtual_channels"] = channels
+    return details
+
+
+def parse_ldap_payload(payload: bytes) -> Dict[str, object]:
+    if not payload or payload[0] != 0x30:
+        return {}
+    details: Dict[str, object] = {}
+    for byte, label in LDAP_OPERATION_TAGS.items():
+        if bytes([byte]) in payload[:48]:
+            details["operation"] = label
+            break
+    preview = safe_decode(payload[:1024])
+    distinguished_names = re.findall(
+        r"(?:CN|OU|DC)=[^,\r\n]+(?:,(?:CN|OU|DC)=[^,\r\n]+)+",
+        preview,
+        re.IGNORECASE,
+    )
+    if distinguished_names:
+        details["distinguished_names"] = distinguished_names[:4]
+    if b"\x80" in payload[:80]:
+        details["simple_bind"] = True
+    return details
+
+
+def parse_kerberos_payload(payload: bytes) -> Dict[str, object]:
+    if not payload:
+        return {}
+    details: Dict[str, object] = {}
+    if payload[0] in KERBEROS_MESSAGE_TYPES:
+        details["message_type"] = KERBEROS_MESSAGE_TYPES[payload[0]]
+    principals = []
+    for token in extract_printable_strings(payload[:1024], minimum=5):
+        lowered = token.lower()
+        if "/" in token and any(lowered.startswith(prefix) for prefix in ("cifs/", "host/", "ldap/", "http/", "termsrv/")):
+            principals.append(token)
+        elif "krbtgt" in lowered:
+            principals.append(token)
+    if principals:
+        details["service_principals"] = principals[:6]
+    return details
+
+
 class GeoIPResolver:
     def __init__(self, database_path: str):
-        self.database_path = database_path or os.getenv("GEOIP_DB", "")
         self.reader = None
         self.cache: Dict[str, str] = {}
+        self.detail_cache: Dict[str, Dict[str, object]] = {}
+        self.status = "GeoIP disabled"
+        self.database_path = ""
+        self.reload(database_path)
+
+    def _resolve_database_path(self, database_path: str) -> str:
+        raw = (database_path or os.getenv("GEOIP_DB", "")).strip().strip('"')
+        if not raw:
+            return ""
+        expanded = Path(raw).expanduser()
+        candidates: List[Path] = []
+        if expanded.is_dir():
+            candidates.extend(sorted(expanded.glob("GeoLite2-*.mmdb")))
+            candidates.extend(sorted(expanded.glob("*.mmdb")))
+        else:
+            candidates.append(expanded)
+            if expanded.suffix.lower() != ".mmdb":
+                candidates.append(expanded.with_suffix(".mmdb"))
+                candidates.append(expanded.parent / f"{expanded.name}.mmdb")
+        for candidate in candidates:
+            try:
+                if candidate.exists() and candidate.is_file():
+                    return str(candidate.resolve())
+            except OSError:
+                continue
+        return str(expanded)
+
+    def reload(self, database_path: str) -> None:
+        requested_path = database_path or os.getenv("GEOIP_DB", "")
+        self.database_path = self._resolve_database_path(requested_path)
+        self.cache = {}
+        self.detail_cache = {}
+        if self.reader is not None:
+            try:
+                self.reader.close()
+            except Exception:
+                pass
+        self.reader = None
         self.status = "GeoIP disabled"
         if not self.database_path:
             self.status = "GeoIP disabled (no database configured)"
@@ -409,37 +776,57 @@ class GeoIPResolver:
         if GeoIPReader is None:
             self.status = "GeoIP disabled (geoip2 not installed)"
             return
+        if not Path(self.database_path).exists():
+            self.status = f"GeoIP disabled (database not found: {self.database_path})"
+            return
         try:
             self.reader = GeoIPReader(self.database_path)
             self.status = f"GeoIP enabled using {self.database_path}"
         except Exception as exc:
             self.status = f"GeoIP disabled ({exc})"
 
-    def lookup(self, ip_value: str) -> str:
-        if ip_value in self.cache:
-            return self.cache[ip_value]
+    def lookup_detail(self, ip_value: str) -> Dict[str, object]:
+        if ip_value in self.detail_cache:
+            return self.detail_cache[ip_value]
         if is_private_or_local(ip_value):
+            detail = {"geo": "Private/Local", "country": "Private/Local", "city": "", "latitude": None, "longitude": None}
+            self.detail_cache[ip_value] = detail
             self.cache[ip_value] = "Private/Local"
-            return self.cache[ip_value]
+            return detail
         if self.reader is None:
+            detail = {"geo": "GeoIP unavailable", "country": "", "city": "", "latitude": None, "longitude": None}
+            self.detail_cache[ip_value] = detail
             self.cache[ip_value] = "GeoIP unavailable"
-            return self.cache[ip_value]
+            return detail
         try:
             record = self.reader.city(ip_value)
             country = record.country.iso_code or record.country.name or "Unknown"
             city = record.city.name or ""
             value = country if not city else f"{country} / {city}"
+            detail = {
+                "geo": value,
+                "country": country,
+                "city": city,
+                "latitude": record.location.latitude,
+                "longitude": record.location.longitude,
+            }
         except Exception:
-            value = "Unknown"
-        self.cache[ip_value] = value
-        return value
+            detail = {"geo": "Unknown", "country": "Unknown", "city": "", "latitude": None, "longitude": None}
+        self.detail_cache[ip_value] = detail
+        self.cache[ip_value] = str(detail["geo"])
+        return detail
+
+    def lookup(self, ip_value: str) -> str:
+        if ip_value in self.cache:
+            return self.cache[ip_value]
+        return str(self.lookup_detail(ip_value).get("geo") or "Unknown")
 
 
 class ThreatPlatform:
     def __init__(self, config: PlatformConfig):
         self.config = config
         self.config.ensure_directories()
-        self.store = SQLiteStore(config.database_path)
+        self.store = create_store(config.database_path, config.storage_backend)
         self.router = AlertRouter(config)
         self.intel = ThreatIntelManager(config.ioc_sources)
         self.intel.load_all()
@@ -448,6 +835,7 @@ class ThreatPlatform:
         self.flows: Dict[Tuple[str, str, int, str], FlowState] = defaultdict(FlowState)
         self.sessions: Dict[str, SessionRecord] = {}
         self.tls_client_hello: Dict[str, Dict[str, object]] = {}
+        self.reassembly_buffers: Dict[Tuple[str, str], ReassemblyBuffer] = defaultdict(ReassemblyBuffer)
         self.horizontal_scans: Dict[str, Dict[str, Deque[Tuple[float, int]]]] = defaultdict(
             lambda: defaultdict(lambda: deque(maxlen=512))
         )
@@ -459,26 +847,81 @@ class ThreatPlatform:
         self.stop_event = threading.Event()
         self.capture_threads: List[threading.Thread] = []
         self.worker_threads: List[threading.Thread] = []
+        self.last_capture_error = ""
         self.hostname_cache: Dict[str, str] = {}
+        self.pending_artifacts: Dict[str, Dict[str, object]] = {}
+        self.pending_ftp_transfers: Dict[Tuple[str, str], Dict[str, object]] = {}
         self.alert_count = 0
         self.packet_count = 0
+        self.generated_report_count = 0
         self.ml_model = None
         self.ml_features: Deque[List[float]] = deque(maxlen=2048)
         self.ml_last_train_count = 0
+        self.sequence_tokens_global: Deque[str] = deque(maxlen=4096)
+        self.lstm_model = LSTMSequenceModel()
+        self.closed = False
 
     def start_workers(self) -> None:
-        if self.worker_threads:
-            return
-        for index in range(max(1, self.config.worker_count)):
+        self.worker_threads = [thread for thread in self.worker_threads if thread.is_alive()]
+        if not self.capture_threads:
+            self.last_capture_error = ""
+        missing = max(1, self.config.worker_count) - len(self.worker_threads)
+        for index in range(max(0, missing)):
             thread = threading.Thread(target=self._worker_loop, name=f"worker-{index}", daemon=True)
             thread.start()
             self.worker_threads.append(thread)
 
-    def stop(self) -> None:
+    def _discard_pending_packets(self) -> int:
+        dropped = 0
+        while True:
+            try:
+                self.packet_queue.get_nowait()
+            except queue.Empty:
+                break
+            self.packet_queue.task_done()
+            dropped += 1
+        return dropped
+
+    def stop_capture(self, drain_timeout: float = 3.0, discard_pending: bool = True) -> None:
         self.stop_event.set()
+        if discard_pending:
+            self._discard_pending_packets()
+        deadline = time.time() + max(0.5, drain_timeout)
+        for thread in self.capture_threads:
+            remaining = max(0.0, deadline - time.time())
+            if remaining <= 0:
+                break
+            thread.join(timeout=min(1.25, remaining))
+        while not discard_pending and time.time() < deadline:
+            if self.packet_queue.unfinished_tasks == 0:
+                break
+            time.sleep(0.05)
+        for thread in self.worker_threads:
+            remaining = max(0.0, deadline - time.time())
+            if remaining <= 0:
+                break
+            thread.join(timeout=min(1.0, remaining))
+        self.capture_threads = [thread for thread in self.capture_threads if thread.is_alive()]
+        self.worker_threads = [thread for thread in self.worker_threads if thread.is_alive()]
+        if not self.capture_threads and not self.worker_threads:
+            self.stop_event.clear()
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        if self.geoip.reader is not None:
+            try:
+                self.geoip.reader.close()
+            except Exception:
+                pass
+        self.store.close()
+
+    def stop(self) -> None:
+        self.stop_capture()
         if self.config.save_reports_on_exit:
             self.generate_reports()
-        self.store.close()
+        self.close()
 
     def snapshot_hosts(self) -> List[HostSnapshot]:
         with self.lock:
@@ -486,6 +929,7 @@ class ThreatPlatform:
         return sorted(rows, key=lambda row: (-row.score, -row.packet_count, row.ip))
 
     def summary(self) -> Dict[str, object]:
+        model = self.model_status()
         return {
             "packets_processed": self.packet_count,
             "alerts_generated": self.alert_count,
@@ -493,6 +937,231 @@ class ThreatPlatform:
             "tracked_hosts": len(self.hosts),
             "tracked_sessions": len(self.sessions),
             "ioc_count": len(self.intel.ip_feeds) + len(self.intel.domain_feeds),
+            "database_backend": getattr(self.store, "backend", "sqlite"),
+            "database_driver": getattr(self.store, "driver", "sqlite3"),
+            "database_target": redact_connection_target(self.config.database_path),
+            "packet_parser": self.config.packet_parser,
+            "ml_status": model["isolation_forest"],
+            "sequence_model_status": model["sequence_model"],
+            "lstm_model_status": model["lstm_sequence_model"],
+        }
+
+    def dashboard_snapshot(self) -> Dict[str, object]:
+        hosts = [row.to_dict() for row in self.snapshot_hosts()[:20]]
+        sessions = self.store.fetch_sessions(limit=20)
+        edges: List[Dict[str, object]] = []
+        for session in sessions[:12]:
+            edges.append(
+                {
+                    "source": session["src_ip"],
+                    "target": session["dst_ip"],
+                    "label": f"{session['transport']}:{session['dst_port']}",
+                    "bytes": session["total_bytes"],
+                }
+            )
+        return {
+            "summary": self.summary(),
+            "severity_counts": self.store.fetch_alert_counts(),
+            "protocol_distribution": self.store.fetch_protocol_distribution(),
+            "top_talkers": self.store.fetch_top_talkers(),
+            "geo_summary": self.store.fetch_geo_summary(),
+            "top_risky": self.store.fetch_top_riskiest(),
+            "mitre_heatmap": self.store.fetch_mitre_heatmap(),
+            "hosts": hosts,
+            "alerts": self.store.fetch_alerts(limit=30),
+            "timeline": self.store.fetch_alert_timeline(limit=40),
+            "sessions": sessions,
+            "topology": edges,
+            "traffic_series": self.store.fetch_time_series("events", hours=self.config.hunt_default_hours, bucket_minutes=15),
+            "alert_series": self.store.fetch_time_series("alerts", hours=self.config.hunt_default_hours, bucket_minutes=15),
+            "artifacts": self.store.fetch_artifacts(limit=30),
+            "hunt_summary": self.store.fetch_hunt_summary(self.config.hunt_default_hours),
+            "asset_inventory": self.store.fetch_asset_inventory(limit=self.config.asset_inventory_limit),
+            "baseline_profiles": self.store.fetch_baseline_profiles(limit=self.config.baseline_profile_limit),
+            "saved_hunts": self.store.fetch_saved_hunts(limit=self.config.max_saved_hunts),
+            "long_term_trends": self.store.fetch_long_term_trends(days=self.config.long_term_trend_days),
+            "live_capture_active": any(thread.is_alive() for thread in self.capture_threads),
+            "capture_error": self.last_capture_error,
+            "dashboard_refresh_seconds": self.config.dashboard_refresh_seconds,
+            "feed_status": self.feed_status(),
+            "model_status": self.model_status(),
+        }
+
+    def capture_active(self) -> bool:
+        return any(thread.is_alive() for thread in self.capture_threads)
+
+    def available_interfaces(self) -> List[str]:
+        if get_if_list is None:
+            return []
+        try:
+            return [str(item) for item in get_if_list()]
+        except Exception:
+            return []
+
+    def launcher_settings(self) -> Dict[str, object]:
+        return {
+            "interfaces": self.config.interfaces,
+            "available_interfaces": self.available_interfaces(),
+            "bpf_filter": self.config.bpf_filter,
+            "quick_filter": self.config.quick_filter,
+            "geoip_db": self.config.geoip_db,
+            "dashboard_refresh_seconds": self.config.dashboard_refresh_seconds,
+            "worker_count": self.config.worker_count,
+            "ioc_sources": self.config.ioc_sources,
+            "database_path": redact_connection_target(self.config.database_path),
+            "storage_backend": self.config.storage_backend,
+            "packet_parser": self.config.packet_parser,
+            "report_dir": self.config.report_dir,
+            "ml_enabled": self.config.ml_enabled,
+            "sequence_model_enabled": self.config.sequence_model_enabled,
+            "lstm_enabled": self.config.lstm_enabled,
+        }
+
+    def feed_status(self) -> List[Dict[str, object]]:
+        return list(self.intel.feed_status)
+
+    def apply_profile(self, profile_name: str) -> Dict[str, object]:
+        profile = PlatformConfig.from_profile(profile_name)
+        profile_updates = {
+            "quick_filter": profile.quick_filter,
+            "high_risk_countries": profile.high_risk_countries,
+            "worker_count": profile.worker_count,
+            "dns_tunnel_query_threshold": profile.dns_tunnel_query_threshold,
+            "horizontal_port_threshold": profile.horizontal_port_threshold,
+            "vertical_host_threshold": profile.vertical_host_threshold,
+            "syn_scan_threshold": profile.syn_scan_threshold,
+            "exfil_bytes_medium": profile.exfil_bytes_medium,
+            "exfil_bytes_high": profile.exfil_bytes_high,
+            "ioc_sources": profile.ioc_sources,
+        }
+        self.config = self.config.merge(profile_updates)
+        self.intel = ThreatIntelManager(self.config.ioc_sources)
+        self.intel.load_all()
+        self.config.save_user_settings()
+        return {
+            "status": "applied",
+            "profile": profile_name,
+            "settings": self.launcher_settings(),
+            "feed_status": self.feed_status(),
+        }
+
+    def model_status(self) -> Dict[str, object]:
+        ready_hosts = sum(
+            1
+            for state in self.hosts.values()
+            if state.snapshot.baseline_ready and len(state.feature_samples) >= self.config.ml_min_host_samples
+        )
+        sequence_ready_hosts = sum(
+            1
+            for state in self.hosts.values()
+            if sum(state.transition_totals.values()) >= self.config.sequence_min_transitions
+        )
+
+        if not self.config.ml_enabled:
+            isolation_state = "Disabled by operator"
+        elif IsolationForest is None:
+            isolation_state = "Unavailable (scikit-learn not installed)"
+        elif len(self.ml_features) < self.config.ml_min_global_samples:
+            isolation_state = f"Learning ({len(self.ml_features)}/{self.config.ml_min_global_samples} samples)"
+        elif self.ml_model is None:
+            isolation_state = "Ready to train"
+        else:
+            isolation_state = f"Ready ({self.ml_last_train_count} learned samples)"
+
+        if not self.config.sequence_model_enabled:
+            sequence_state = "Disabled by operator"
+        elif sequence_ready_hosts <= 0:
+            sequence_state = f"Learning ({self.config.sequence_min_transitions} transitions required)"
+        else:
+            sequence_state = f"Ready ({sequence_ready_hosts} hosts profiled)"
+
+        if not self.config.lstm_enabled:
+            lstm_state = "Disabled by operator"
+        elif not self.lstm_model.available:
+            lstm_state = f"Unavailable (tensorflow/keras not installed: {TENSORFLOW_IMPORT_ERROR})"
+        elif len(self.sequence_tokens_global) < self.config.lstm_min_samples:
+            lstm_state = f"Learning ({len(self.sequence_tokens_global)}/{self.config.lstm_min_samples} sequence tokens)"
+        elif self.lstm_model.model is None:
+            lstm_state = "Ready to train"
+        else:
+            lstm_state = f"Ready ({self.lstm_model.last_train_count} sequence tokens)"
+
+        return {
+            "ml_enabled": self.config.ml_enabled,
+            "sequence_model_enabled": self.config.sequence_model_enabled,
+            "isolation_forest": isolation_state,
+            "sequence_model": sequence_state,
+            "lstm_sequence_model": lstm_state,
+            "global_samples": len(self.ml_features),
+            "trained_samples": self.ml_last_train_count,
+            "feature_dimensions": len(self.ml_features[-1]) if self.ml_features else 0,
+            "baseline_ready_hosts": ready_hosts,
+            "sequence_ready_hosts": sequence_ready_hosts,
+            "lstm_tokens": len(self.sequence_tokens_global),
+            "lstm_vocabulary": len(self.lstm_model.token_to_id),
+        }
+
+    def update_settings(self, updates: Dict[str, object]) -> Dict[str, object]:
+        restart_required = False
+        normalized: Dict[str, object] = {}
+        if "interfaces" in updates:
+            interfaces = updates.get("interfaces") or []
+            if isinstance(interfaces, str):
+                interfaces = [item.strip() for item in interfaces.split(",") if item.strip()]
+            normalized["interfaces"] = list(interfaces)
+            if normalized["interfaces"] != self.config.interfaces:
+                restart_required = restart_required or self.capture_active()
+        if "bpf_filter" in updates:
+            normalized["bpf_filter"] = str(updates.get("bpf_filter") or "").strip()
+            if normalized["bpf_filter"] != self.config.bpf_filter:
+                restart_required = restart_required or self.capture_active()
+        if "quick_filter" in updates:
+            normalized["quick_filter"] = str(updates.get("quick_filter") or "all").strip() or "all"
+        if "packet_parser" in updates:
+            normalized["packet_parser"] = str(updates.get("packet_parser") or "scapy").strip().lower() or "scapy"
+        if "dashboard_refresh_seconds" in updates:
+            try:
+                normalized["dashboard_refresh_seconds"] = max(2, min(60, int(updates.get("dashboard_refresh_seconds") or 5)))
+            except (TypeError, ValueError):
+                normalized["dashboard_refresh_seconds"] = self.config.dashboard_refresh_seconds
+        if "worker_count" in updates:
+            try:
+                normalized["worker_count"] = max(1, min(8, int(updates.get("worker_count") or self.config.worker_count)))
+            except (TypeError, ValueError):
+                normalized["worker_count"] = self.config.worker_count
+        if "ml_enabled" in updates:
+            normalized["ml_enabled"] = as_bool(updates.get("ml_enabled"))
+        if "sequence_model_enabled" in updates:
+            normalized["sequence_model_enabled"] = as_bool(updates.get("sequence_model_enabled"))
+        if "lstm_enabled" in updates:
+            normalized["lstm_enabled"] = as_bool(updates.get("lstm_enabled"))
+        if "geoip_db" in updates:
+            normalized["geoip_db"] = str(updates.get("geoip_db") or "").strip()
+        if "ioc_sources" in updates:
+            sources = updates.get("ioc_sources") or []
+            if isinstance(sources, str):
+                sources = [item.strip() for item in sources.splitlines() if item.strip()]
+            normalized["ioc_sources"] = list(sources)
+
+        merged = self.config.merge(normalized)
+        self.config = merged
+        geoip_reenriched_events = 0
+        if "geoip_db" in normalized:
+            self.geoip.reload(self.config.geoip_db)
+            if self.geoip.reader is not None:
+                geoip_reenriched_events = self.store.rebuild_geoip(self.geoip.lookup, limit=5000)
+                self.config.geoip_db = self.geoip.database_path
+        if "ioc_sources" in normalized:
+            self.intel = ThreatIntelManager(self.config.ioc_sources)
+            self.intel.load_all()
+        self.config.save_user_settings()
+        return {
+            "status": "saved",
+            "restart_required": restart_required,
+            "geoip_status": self.geoip.status,
+            "geoip_reenriched_events": geoip_reenriched_events,
+            "settings": self.launcher_settings(),
+            "model_status": self.model_status(),
         }
 
     def export_iocs(self, path: str) -> str:
@@ -507,9 +1176,51 @@ class ThreatPlatform:
 
     def generate_reports(self) -> Dict[str, str]:
         generator = ReportGenerator(self.store, self.config.report_dir)
+        self.generated_report_count += 1
         return generator.generate(self.summary(), self.snapshot_hosts())
 
+    def benchmark_ingest(self, sample_count: Optional[int] = None) -> Dict[str, object]:
+        total = max(100, int(sample_count or self.config.benchmark_default_packets))
+        start = time.perf_counter()
+        allowed = 0
+        for index in range(total):
+            payload = {
+                "timestamp": time.time(),
+                "src_ip": f"10.10.{index % 250}.{(index % 200) + 1}",
+                "dst_ip": f"198.51.100.{(index % 200) + 1}",
+                "src_port": 40000 + (index % 20000),
+                "dst_port": [53, 80, 443, 445, 3389][index % 5],
+                "transport": "UDP" if index % 5 == 0 else "TCP",
+                "category": ["DNS", "HTTP", "TLS", "SMB", "RDP"][index % 5],
+                "packet_len": 96 + (index % 1400),
+                "detail": "benchmark synthetic context",
+                "ttl": 64,
+            }
+            context = self.build_context_from_payload(payload)
+            if self._allow_context(context):
+                allowed += 1
+                self._sequence_token(context)
+        elapsed = max(time.perf_counter() - start, 0.000001)
+        return {
+            "mode": "dry-run",
+            "packets": total,
+            "allowed": allowed,
+            "elapsed_seconds": round(elapsed, 4),
+            "packets_per_second": int(total / elapsed),
+            "note": "Measures normalization, IOC lookup, GeoIP lookup cache, quick-filter checks, and sequence tokenization without writing events.",
+        }
+
     def replay_pcap(self, pcap_path: str, playback_speed: Optional[float] = None) -> None:
+        parser = (self.config.packet_parser or "scapy").lower()
+        if parser == "dpkt":
+            self.replay_pcap_dpkt(pcap_path, playback_speed)
+            return
+        if parser == "pyshark":
+            self.replay_pcap_pyshark(pcap_path, playback_speed)
+            return
+        if parser == "auto" and PcapReader is None and dpkt is not None:
+            self.replay_pcap_dpkt(pcap_path, playback_speed)
+            return
         if PcapReader is None:
             raise RuntimeError(f"Scapy is required for PCAP playback: {SCAPY_IMPORT_ERROR}")
         file_path = Path(pcap_path)
@@ -529,11 +1240,95 @@ class ThreatPlatform:
                 previous = packet_time
         self.packet_queue.join()
 
+    def replay_pcap_dpkt(self, pcap_path: str, playback_speed: Optional[float] = None) -> None:
+        if dpkt is None:
+            raise RuntimeError(f"dpkt parser requested but unavailable: {DPKT_IMPORT_ERROR}")
+        file_path = Path(pcap_path)
+        if not file_path.exists():
+            raise FileNotFoundError(file_path)
+        previous = None
+        speed = self.config.playback_speed if playback_speed is None else playback_speed
+        with file_path.open("rb") as handle:
+            reader = dpkt.pcap.Reader(handle)
+            for packet_time, frame in reader:
+                if speed and previous is not None:
+                    wait = max(0.0, float(packet_time) - previous) / max(speed, 0.0001)
+                    if wait:
+                        time.sleep(min(wait, 1.5))
+                context = self.build_context_from_dpkt_frame(bytes(frame), float(packet_time))
+                if context is not None and self._allow_context(context):
+                    self._process_context(context, packet=None, payload_override=self._payload_from_dpkt_frame(bytes(frame)))
+                previous = float(packet_time)
+
+    def replay_pcap_pyshark(self, pcap_path: str, playback_speed: Optional[float] = None) -> None:
+        if pyshark is None:
+            raise RuntimeError(f"pyshark parser requested but unavailable: {PYSHARK_IMPORT_ERROR}")
+        file_path = Path(pcap_path)
+        if not file_path.exists():
+            raise FileNotFoundError(file_path)
+        previous = None
+        speed = self.config.playback_speed if playback_speed is None else playback_speed
+        capture = pyshark.FileCapture(str(file_path), keep_packets=False)
+        try:
+            for packet in capture:
+                packet_time = float(getattr(packet, "sniff_timestamp", time.time()) or time.time())
+                if speed and previous is not None:
+                    wait = max(0.0, packet_time - previous) / max(speed, 0.0001)
+                    if wait:
+                        time.sleep(min(wait, 1.5))
+                payload = self.payload_from_pyshark_packet(packet, packet_time)
+                if payload:
+                    self.ingest_remote_context(payload)
+                previous = packet_time
+        finally:
+            capture.close()
+
+    def ingest_remote_raw_packet(self, payload: Dict[str, object]) -> Dict[str, object]:
+        import base64
+
+        encoded = str(payload.get("packet_base64") or payload.get("frame_base64") or "").strip()
+        if not encoded:
+            raise ValueError("packet_base64 is required for raw packet ingestion")
+        raw_frame = base64.b64decode(encoded.encode("utf-8"), validate=False)
+        timestamp = float(payload.get("timestamp") or time.time())
+        context = self.build_context_from_raw_frame(raw_frame, timestamp, str(payload.get("parser") or ""))
+        if context is None or not self._allow_context(context):
+            return {"status": "ignored", "reason": "parser-or-filter", "sensor_id": payload.get("sensor_id", "")}
+        self._process_context(context, packet=None, payload_override=self.extract_transport_payload(raw_frame))
+        return {
+            "status": "ingested",
+            "session_id": context.session_id,
+            "category": context.category,
+            "sensor_id": payload.get("sensor_id", ""),
+        }
+
+    def build_context_from_raw_frame(self, raw_frame: bytes, timestamp: float, parser: str = "") -> Optional[PacketContext]:
+        selected = (parser or self.config.packet_parser or "auto").lower()
+        if selected in {"dpkt", "auto"} and dpkt is not None:
+            context = self.build_context_from_dpkt_frame(raw_frame, timestamp)
+            if context is not None:
+                return context
+        if Ether is not None:
+            try:
+                return self.build_context(Ether(raw_frame), timestamp)
+            except Exception:
+                return None
+        return None
+
     def start_live_capture(self) -> None:
         if sniff is None:
             raise RuntimeError(f"Scapy is required for live capture: {SCAPY_IMPORT_ERROR}")
+        self.capture_threads = [thread for thread in self.capture_threads if thread.is_alive()]
+        if self.capture_threads:
+            return
+        self.last_capture_error = ""
+        self.stop_event.clear()
         self.start_workers()
-        interfaces = self.config.interfaces or [None]
+        configured = [iface for iface in self.config.interfaces if str(iface).strip()]
+        if any(str(iface).strip().lower() in {"all", "*"} for iface in configured):
+            interfaces = self.available_interfaces() or [None]
+        else:
+            interfaces = configured or [None]
         for iface in interfaces:
             thread = threading.Thread(
                 target=self._sniff_interface,
@@ -545,6 +1340,8 @@ class ThreatPlatform:
             self.capture_threads.append(thread)
 
     def enqueue_packet(self, packet, packet_time: Optional[float] = None) -> None:
+        if self.stop_event.is_set():
+            return
         try:
             self.packet_queue.put((packet, packet_time), timeout=2)
         except queue.Full:
@@ -553,21 +1350,33 @@ class ThreatPlatform:
     def _worker_loop(self) -> None:
         while not self.stop_event.is_set():
             try:
-                packet, packet_time = self.packet_queue.get(timeout=0.5)
+                packet, packet_time = self.packet_queue.get(timeout=0.2)
             except queue.Empty:
                 continue
             try:
+                if self.stop_event.is_set():
+                    return
                 self.process_packet(packet, packet_time)
+            except Exception:
+                if not self.stop_event.is_set():
+                    traceback.print_exc()
             finally:
                 self.packet_queue.task_done()
 
     def _sniff_interface(self, iface: Optional[str]) -> None:
-        sniff(
-            iface=iface,
-            store=False,
-            filter=self.config.bpf_filter or None,
-            prn=lambda packet: self.enqueue_packet(packet),
-        )
+        while not self.stop_event.is_set():
+            try:
+                sniff(
+                    iface=iface,
+                    store=False,
+                    filter=self.config.bpf_filter or None,
+                    prn=lambda packet: self.enqueue_packet(packet),
+                    timeout=1,
+                )
+            except Exception as exc:
+                self.last_capture_error = f"Capture failed on {iface or 'default adapter'}: {exc}"
+                self.stop_event.set()
+                break
 
     def resolve_hostname(self, ip_value: str) -> str:
         cached = self.hostname_cache.get(ip_value)
@@ -591,13 +1400,31 @@ class ThreatPlatform:
         context = self.build_context(packet, packet_time)
         if context is None or not self._allow_context(context):
             return
+        self._process_context(context, packet)
 
+    def ingest_remote_context(self, payload: Dict[str, object]) -> Dict[str, object]:
+        context = self.build_context_from_payload(payload)
+        if not self._allow_context(context):
+            return {"status": "ignored", "reason": "quick-filter", "session_id": context.session_id}
+        raw_payload = b""
+        payload_b64 = str(payload.get("payload_base64") or "").strip()
+        if payload_b64:
+            try:
+                import base64
+
+                raw_payload = base64.b64decode(payload_b64.encode("utf-8"), validate=False)
+            except Exception:
+                raw_payload = b""
+        self._process_context(context, packet=None, payload_override=raw_payload[: self.config.stream_file_chunk_bytes])
+        return {"status": "ingested", "session_id": context.session_id, "category": context.category}
+
+    def _process_context(self, context: PacketContext, packet=None, payload_override: bytes = b"") -> None:
         with self.lock:
             self.packet_count += 1
             state = self.get_host_state(context.src_ip)
             self._decay_score(state, context.timestamp)
             self._update_state(state, context)
-            self._update_session(context, packet)
+            self._update_session(context, packet, payload_override)
             self._update_reputation(context, state)
             self.store.insert_event(context)
             self.store.upsert_session(self.sessions[context.session_id])
@@ -612,11 +1439,303 @@ class ThreatPlatform:
             findings.extend(self._detect_beaconing(context))
             findings.extend(self._detect_exfiltration(state, context))
             findings.extend(self._detect_baseline_deviation(state, context))
+            findings.extend(self._detect_sequence_anomaly(state, context))
+            findings.extend(self._detect_lstm_sequence_anomaly(state, context))
             findings.extend(self._detect_ml_anomaly(state, context))
             findings.extend(self._detect_protocol_activity(context))
 
             self._apply_findings(state, context, findings)
             self._persist_baseline_if_needed(state, context.timestamp)
+
+    def build_context_from_payload(self, payload: Dict[str, object]) -> PacketContext:
+        timestamp = float(payload.get("timestamp") or time.time())
+        src_ip = str(payload.get("src_ip") or "").strip()
+        dst_ip = str(payload.get("dst_ip") or "").strip()
+        if not src_ip or not dst_ip:
+            raise ValueError("src_ip and dst_ip are required for remote ingestion")
+        src_port = int(payload.get("src_port") or 0)
+        dst_port = int(payload.get("dst_port") or 0)
+        transport = str(payload.get("transport") or "TCP").upper()
+        category_map = {
+            "HTTP": "HTTP",
+            "HTTPS": "HTTPS",
+            "TLS": "TLS",
+            "DNS": "DNS",
+            "MDNS": "mDNS",
+            "FTP": "FTP",
+            "SMB": "SMB",
+            "RDP": "RDP",
+            "LDAP": "LDAP",
+            "KERBEROS": "KERBEROS",
+            "P2P": "P2P",
+            "IRC": "IRC",
+            "TCP": "TCP",
+            "UDP": "UDP",
+            "IP": "IP",
+        }
+        category = category_map.get(str(payload.get("category") or transport).upper(), str(payload.get("category") or transport).upper())
+        direction = str(payload.get("direction") or infer_direction(src_ip, dst_ip))
+        private_pair = bool(payload.get("private_pair")) or (is_private_or_local(src_ip) and is_private_or_local(dst_ip))
+        hostname = str(payload.get("hostname") or (dst_ip if private_pair else self.resolve_hostname(dst_ip))).strip() or dst_ip
+        domain = str(payload.get("base_domain") or base_domain(hostname or dst_ip))
+        geo = str(payload.get("geo") or self.geoip.lookup(dst_ip))
+        protocol_tags = [str(item) for item in payload.get("protocol_tags", []) if item]
+        protocol_details = dict(payload.get("protocol_details", {}) or {})
+        dns_query = normalize_domain(str(payload.get("dns_query") or ""))
+        http_url = str(payload.get("http_url") or "").strip()
+        tls_sni = str(payload.get("tls_sni") or "").strip()
+        if tls_sni and not hostname:
+            hostname = tls_sni
+            domain = base_domain(tls_sni)
+        session_id = str(payload.get("session_id") or normalize_session_id(src_ip, src_port, dst_ip, dst_port, transport))
+        trusted = bool(payload.get("trusted"))
+        if not trusted:
+            trusted = any(keyword in hostname.lower() for keyword in TRUSTED_HOST_KEYWORDS) or private_pair
+        ioc_matches = self.intel.match([src_ip, dst_ip], [hostname, domain, dns_query, tls_sni])
+        detail = str(payload.get("detail") or http_url or dns_query or protocol_details.get("command") or f"{src_port}->{dst_port}")
+        context = PacketContext(
+            timestamp=timestamp,
+            src_ip=src_ip,
+            dst_ip=dst_ip,
+            src_port=src_port,
+            dst_port=dst_port,
+            transport=transport,
+            category=category,
+            detail=detail,
+            packet_len=int(payload.get("packet_len") or len(str(payload.get("payload_preview") or "")) or 0),
+            direction=direction,
+            hostname=hostname,
+            base_domain=domain,
+            geo=geo,
+            trusted=trusted,
+            private_pair=private_pair,
+            dns_query=dns_query,
+            http_method=str(payload.get("http_method") or ""),
+            http_url=http_url,
+            http_host=str(payload.get("http_host") or hostname),
+            http_user_agent=str(payload.get("http_user_agent") or ""),
+            http_body_size=int(payload.get("http_body_size") or 0),
+            http_query_string=str(payload.get("http_query_string") or ""),
+            http_status=str(payload.get("http_status") or ""),
+            http_content_type=str(payload.get("http_content_type") or ""),
+            tls_version=str(payload.get("tls_version") or ""),
+            tls_sni=tls_sni,
+            tls_cert_subject=str(payload.get("tls_cert_subject") or ""),
+            tls_cert_issuer=str(payload.get("tls_cert_issuer") or ""),
+            tls_self_signed=bool(payload.get("tls_self_signed")),
+            payload_preview=str(payload.get("payload_preview") or ""),
+            os_guess=str(payload.get("os_guess") or fingerprint_os(int(payload.get("ttl") or 0), int(payload.get("tcp_window") or 0))),
+            ttl=int(payload.get("ttl") or 0),
+            tcp_window=int(payload.get("tcp_window") or 0),
+            tcp_flags=int(payload.get("tcp_flags") or 0),
+            tcp_seq=int(payload.get("tcp_seq") or 0),
+            tcp_ack=int(payload.get("tcp_ack") or 0),
+            tcp_payload_len=int(payload.get("tcp_payload_len") or 0),
+            session_id=session_id,
+            protocol_tags=protocol_tags,
+            protocol_details=protocol_details,
+            ioc_matches=ioc_matches,
+            risk_score=int(payload.get("risk_score") or 0),
+            risk_factors=[str(item) for item in payload.get("risk_factors", []) if item],
+        )
+        return context
+
+    def _inet_to_text(self, value: bytes) -> str:
+        if len(value) == 4:
+            return socket.inet_ntop(socket.AF_INET, value)
+        if len(value) == 16:
+            return socket.inet_ntop(socket.AF_INET6, value)
+        return ""
+
+    def _dpkt_ip_packet(self, raw_frame: bytes):
+        if dpkt is None:
+            return None
+        try:
+            eth = dpkt.ethernet.Ethernet(raw_frame)
+            packet = eth.data
+        except Exception:
+            packet = None
+        if packet is not None and packet.__class__.__name__ in {"IP", "IP6"}:
+            return packet
+        try:
+            packet = dpkt.ip.IP(raw_frame)
+            return packet
+        except Exception:
+            return None
+
+    def _payload_from_dpkt_frame(self, raw_frame: bytes) -> bytes:
+        packet = self._dpkt_ip_packet(raw_frame)
+        if packet is None:
+            return b""
+        transport = getattr(packet, "data", None)
+        data = getattr(transport, "data", b"")
+        return bytes(data or b"")
+
+    def extract_transport_payload(self, raw_frame: bytes) -> bytes:
+        if dpkt is not None:
+            payload = self._payload_from_dpkt_frame(raw_frame)
+            if payload:
+                return payload[: self.config.stream_file_chunk_bytes]
+        if Ether is not None and Raw is not None:
+            try:
+                packet = Ether(raw_frame)
+                if packet.haslayer(Raw):
+                    return bytes(packet[Raw].load[: self.config.stream_file_chunk_bytes])
+            except Exception:
+                return b""
+        return b""
+
+    def build_context_from_dpkt_frame(self, raw_frame: bytes, timestamp: Optional[float] = None) -> Optional[PacketContext]:
+        if dpkt is None:
+            return None
+        packet = self._dpkt_ip_packet(raw_frame)
+        if packet is None:
+            return None
+        src_ip = self._inet_to_text(getattr(packet, "src", b""))
+        dst_ip = self._inet_to_text(getattr(packet, "dst", b""))
+        if not src_ip or not dst_ip:
+            return None
+        transport_packet = getattr(packet, "data", None)
+        transport = "IP"
+        src_port = 0
+        dst_port = 0
+        tcp_flags = 0
+        tcp_seq = 0
+        tcp_ack = 0
+        tcp_window = 0
+        payload = bytes(getattr(transport_packet, "data", b"") or b"")
+        if isinstance(transport_packet, dpkt.tcp.TCP):
+            transport = "TCP"
+            src_port = int(transport_packet.sport)
+            dst_port = int(transport_packet.dport)
+            tcp_flags = int(transport_packet.flags)
+            tcp_seq = int(transport_packet.seq)
+            tcp_ack = int(transport_packet.ack)
+            tcp_window = int(transport_packet.win)
+        elif isinstance(transport_packet, dpkt.udp.UDP):
+            transport = "UDP"
+            src_port = int(transport_packet.sport)
+            dst_port = int(transport_packet.dport)
+        direction = infer_direction(src_ip, dst_ip)
+        category = self._category_from_ports(transport, src_port, dst_port, payload)
+        protocol_details = self._dissect_protocol_payload(category, payload)
+        http_info = parse_http_payload(payload)
+        dns_query = ""
+        if category in {"DNS", "mDNS"} and payload:
+            try:
+                dns = dpkt.dns.DNS(payload)
+                if dns.qd:
+                    dns_query = normalize_domain(str(dns.qd[0].name))
+            except Exception:
+                dns_query = ""
+        tls_hello = parse_tls_client_hello(payload)
+        tls_cert = parse_tls_certificate(payload)
+        hostname = ""
+        if http_info.get("host"):
+            hostname = str(http_info.get("host") or "")
+        elif tls_hello.get("sni"):
+            hostname = str(tls_hello.get("sni") or "")
+        elif dns_query:
+            hostname = dns_query
+        return self.build_context_from_payload(
+            {
+                "timestamp": float(timestamp or time.time()),
+                "src_ip": src_ip,
+                "dst_ip": dst_ip,
+                "src_port": src_port,
+                "dst_port": dst_port,
+                "transport": transport,
+                "category": category,
+                "direction": direction,
+                "hostname": hostname,
+                "dns_query": dns_query,
+                "http_method": str(http_info.get("method") or ""),
+                "http_url": str(http_info.get("url") or ""),
+                "http_host": str(http_info.get("host") or ""),
+                "http_user_agent": str(http_info.get("user_agent") or ""),
+                "http_body_size": int(http_info.get("body_size") or 0),
+                "http_query_string": str(http_info.get("query_string") or ""),
+                "http_status": str(http_info.get("status") or ""),
+                "http_content_type": str(http_info.get("content_type") or ""),
+                "tls_version": str(tls_hello.get("version") or tls_cert.get("version") or ""),
+                "tls_sni": str(tls_hello.get("sni") or ""),
+                "tls_cert_subject": str(tls_cert.get("subject") or ""),
+                "tls_cert_issuer": str(tls_cert.get("issuer") or ""),
+                "tls_self_signed": bool(tls_cert.get("self_signed")),
+                "packet_len": len(raw_frame),
+                "payload_preview": safe_decode(payload[:512]),
+                "ttl": int(getattr(packet, "ttl", getattr(packet, "hlim", 0)) or 0),
+                "tcp_window": tcp_window,
+                "tcp_flags": tcp_flags,
+                "tcp_seq": tcp_seq,
+                "tcp_ack": tcp_ack,
+                "tcp_payload_len": len(payload),
+                "protocol_details": protocol_details,
+            }
+        )
+
+    def payload_from_pyshark_packet(self, packet, packet_time: Optional[float] = None) -> Dict[str, object]:
+        def layer_value(layer_name: str, field_name: str, default: str = "") -> str:
+            layer = getattr(packet, layer_name, None)
+            if layer is None:
+                return default
+            return str(getattr(layer, field_name, default) or default)
+
+        src_ip = layer_value("ip", "src") or layer_value("ipv6", "src")
+        dst_ip = layer_value("ip", "dst") or layer_value("ipv6", "dst")
+        if not src_ip or not dst_ip:
+            return {}
+        transport = "TCP" if hasattr(packet, "tcp") else "UDP" if hasattr(packet, "udp") else "IP"
+        src_port = int(layer_value("tcp", "srcport", "0") or layer_value("udp", "srcport", "0") or 0)
+        dst_port = int(layer_value("tcp", "dstport", "0") or layer_value("udp", "dstport", "0") or 0)
+        category = layer_value("frame", "protocols", "").split(":")[-1].upper()
+        if category in {"DATA", ""}:
+            category = self._category_from_ports(transport, src_port, dst_port, b"")
+        return {
+            "timestamp": float(packet_time or time.time()),
+            "src_ip": src_ip,
+            "dst_ip": dst_ip,
+            "src_port": src_port,
+            "dst_port": dst_port,
+            "transport": transport,
+            "category": category,
+            "direction": infer_direction(src_ip, dst_ip),
+            "hostname": layer_value("dns", "qry_name") or layer_value("tls", "handshake_extensions_server_name"),
+            "dns_query": layer_value("dns", "qry_name"),
+            "http_method": layer_value("http", "request_method"),
+            "http_url": layer_value("http", "request_uri"),
+            "http_user_agent": layer_value("http", "user_agent"),
+            "http_status": layer_value("http", "response_code"),
+            "tls_sni": layer_value("tls", "handshake_extensions_server_name"),
+            "packet_len": int(getattr(packet, "length", 0) or layer_value("frame", "len", "0") or 0),
+            "payload_preview": str(packet)[:512],
+        }
+
+    def _category_from_ports(self, transport: str, src_port: int, dst_port: int, payload: bytes) -> str:
+        ports = {src_port, dst_port}
+        if ports & DNS_PORTS:
+            return "DNS"
+        if MDNS_PORT in ports:
+            return "mDNS"
+        if ports & HTTP_PORTS or parse_http_payload(payload).get("is_http"):
+            return "HTTP"
+        if ports & HTTPS_PORTS:
+            return "TLS"
+        if ports & FTP_PORTS:
+            return "FTP"
+        if ports & SMB_PORTS:
+            return "SMB"
+        if ports & RDP_PORTS:
+            return "RDP"
+        if ports & LDAP_PORTS:
+            return "LDAP"
+        if ports & KERBEROS_PORTS:
+            return "KERBEROS"
+        if ports & IRC_PORTS:
+            return "IRC"
+        if ports & P2P_PORTS:
+            return "P2P"
+        return transport
 
     def build_context(self, packet, packet_time: Optional[float] = None) -> Optional[PacketContext]:
         if IP is None:
@@ -637,6 +1756,8 @@ class ThreatPlatform:
         dst_port = 0
         tcp_flags = 0
         tcp_window = 0
+        tcp_seq = 0
+        tcp_ack = 0
         payload = b""
         ttl = int(getattr(ip_layer, "ttl", getattr(ip_layer, "hlim", 0)) or 0)
 
@@ -646,6 +1767,8 @@ class ThreatPlatform:
             dst_port = int(packet[TCP].dport)
             tcp_flags = int(packet[TCP].flags)
             tcp_window = int(packet[TCP].window)
+            tcp_seq = int(getattr(packet[TCP], "seq", 0) or 0)
+            tcp_ack = int(getattr(packet[TCP], "ack", 0) or 0)
         elif UDP is not None and packet.haslayer(UDP):
             transport = "UDP"
             src_port = int(packet[UDP].sport)
@@ -671,11 +1794,14 @@ class ThreatPlatform:
         http_user_agent = ""
         http_body_size = 0
         http_query_string = ""
+        http_status = ""
+        http_content_type = ""
         tls_version = ""
         tls_sni = ""
         tls_cert_subject = ""
         tls_cert_issuer = ""
         tls_self_signed = False
+        protocol_details: Dict[str, object] = {}
 
         if DNS is not None and packet.haslayer(DNS) and getattr(packet[DNS], "qd", None):
             dns_query = normalize_domain(packet[DNS].qd.qname.decode(errors="ignore"))
@@ -689,6 +1815,8 @@ class ThreatPlatform:
             if http_info.get("is_response"):
                 category = "HTTP"
                 protocol_tags.append("http-response")
+                http_status = str(http_info.get("status", ""))
+                http_content_type = str(http_info.get("content_type", ""))
             else:
                 category = "HTTP" if dst_port not in HTTPS_PORTS else "HTTPS"
                 http_method = str(http_info.get("method", ""))
@@ -739,6 +1867,10 @@ class ThreatPlatform:
 
         if dst_port in P2P_PORTS or src_port in P2P_PORTS:
             protocol_tags.append("p2p-port")
+        if dst_port in FTP_PORTS or src_port in FTP_PORTS:
+            protocol_tags.append("ftp")
+            if category == "TCP":
+                category = "FTP"
         if dst_port in SMB_PORTS or src_port in SMB_PORTS:
             protocol_tags.append("smb")
             if category == "TCP":
@@ -755,6 +1887,12 @@ class ThreatPlatform:
             protocol_tags.append("kerberos")
             if category in {"UDP", "TCP"}:
                 category = "KERBEROS"
+
+        protocol_details = self._dissect_protocol_payload(category, payload)
+        if category == "FTP" and protocol_details.get("command"):
+            detail = str(protocol_details.get("command"))
+            if protocol_details.get("argument"):
+                detail = f"{detail} {protocol_details.get('argument')}"
 
         session_id = normalize_session_id(src_ip, src_port, dst_ip, dst_port, transport)
         trusted = any(keyword in hostname.lower() for keyword in TRUSTED_HOST_KEYWORDS) or private_pair
@@ -786,6 +1924,8 @@ class ThreatPlatform:
             http_user_agent=http_user_agent,
             http_body_size=http_body_size,
             http_query_string=http_query_string,
+            http_status=http_status,
+            http_content_type=http_content_type,
             tls_version=tls_version,
             tls_sni=tls_sni,
             tls_cert_subject=tls_cert_subject,
@@ -796,11 +1936,30 @@ class ThreatPlatform:
             ttl=ttl,
             tcp_window=tcp_window,
             tcp_flags=tcp_flags,
+            tcp_seq=tcp_seq,
+            tcp_ack=tcp_ack,
+            tcp_payload_len=len(payload),
             session_id=session_id,
             protocol_tags=protocol_tags,
+            protocol_details=protocol_details,
             ioc_matches=ioc_matches,
         )
         return context
+
+    def _dissect_protocol_payload(self, category: str, payload: bytes) -> Dict[str, object]:
+        if not payload:
+            return {}
+        if category == "FTP":
+            return parse_ftp_payload(payload)
+        if category == "SMB":
+            return parse_smb_payload(payload)
+        if category == "RDP":
+            return parse_rdp_payload(payload)
+        if category == "LDAP":
+            return parse_ldap_payload(payload)
+        if category == "KERBEROS":
+            return parse_kerberos_payload(payload)
+        return {}
 
     def _allow_context(self, context: PacketContext) -> bool:
         quick = self.config.quick_filter.lower()
@@ -865,17 +2024,85 @@ class ThreatPlatform:
             state.interarrival_samples.append(delta)
         state.last_packet_time = context.timestamp
 
+        interarrival = state.interarrival_samples[-1] if state.interarrival_samples else 0.0
+        packet_rate_30s = len(state.packet_times) / 30.0
+        dns_rate = len(state.dns_times) / max(1.0, float(self.config.dns_frequency_window))
+        outbound_bytes = sum_bytes(state.outbound_bytes)
+        port_seen = max(1, state.port_counts[context.dst_port])
+        protocol_seen = max(1, state.protocol_counts[context.category])
+        port_rarity = 1.0 / float(port_seen)
+        protocol_rarity = 1.0 / float(protocol_seen)
+        entropy_source = context.dns_query or context.hostname or context.payload_preview
         feature_vector = [
             float(context.packet_len),
             float(context.dst_port),
             float(transport_code(context.category)),
             float(context.ttl or 0),
             float(context.http_body_size or 0),
+            float(interarrival),
+            float(packet_rate_30s),
+            float(dns_rate),
+            float(outbound_bytes),
+            float(port_rarity),
+            float(protocol_rarity),
+            float(shannon_entropy(entropy_source[:160])),
+            float(direction_code(context.direction)),
+            float(len(context.ioc_matches)),
         ]
         state.feature_samples.append(feature_vector)
         self.ml_features.append(feature_vector)
 
-    def _update_session(self, context: PacketContext, packet) -> None:
+        sequence_token = self._sequence_token(context)
+        previous_token = state.last_sequence_token
+        if previous_token and sequence_token:
+            previous_total = int(state.transition_totals.get(previous_token, 0))
+            pair_seen = int(state.transition_counts[previous_token].get(sequence_token, 0))
+            context.protocol_details["_sequence_transition"] = {
+                "previous": previous_token,
+                "current": sequence_token,
+                "previous_total": previous_total,
+                "pair_seen": pair_seen,
+            }
+            state.transition_counts[previous_token][sequence_token] += 1
+            state.transition_totals[previous_token] += 1
+        if sequence_token:
+            self._update_lstm_sequence(state, context, sequence_token)
+            state.last_sequence_token = sequence_token
+
+    def _update_lstm_sequence(self, state: HostState, context: PacketContext, sequence_token: str) -> None:
+        if not self.config.lstm_enabled:
+            state.sequence_tokens.append(sequence_token)
+            self.sequence_tokens_global.append(sequence_token)
+            return
+
+        previous_tokens = list(state.sequence_tokens)
+        if len(previous_tokens) >= self.config.lstm_sequence_length:
+            probability = self.lstm_model.probability(previous_tokens, sequence_token, self.config.lstm_sequence_length)
+            if probability is not None:
+                context.protocol_details["_lstm_prediction"] = {
+                    "token": sequence_token,
+                    "probability": probability,
+                    "sequence_length": self.config.lstm_sequence_length,
+                }
+
+        state.sequence_tokens.append(sequence_token)
+        self.sequence_tokens_global.append(sequence_token)
+        if not self.lstm_model.available:
+            return
+        if len(self.sequence_tokens_global) < self.config.lstm_min_samples:
+            return
+        if len(self.sequence_tokens_global) - self.lstm_model.last_train_count < max(50, self.config.lstm_sequence_length * 4):
+            return
+        try:
+            self.lstm_model.train(
+                list(self.sequence_tokens_global),
+                sequence_length=self.config.lstm_sequence_length,
+                epochs=2,
+            )
+        except Exception as exc:
+            self.lstm_model.error = str(exc)
+
+    def _update_session(self, context: PacketContext, packet=None, payload_override: bytes = b"") -> None:
         session = self.sessions.get(context.session_id)
         if session is None:
             session = SessionRecord(
@@ -896,10 +2123,34 @@ class ThreatPlatform:
             session.protocol_hints.append(context.category)
         if context.payload_preview and len(session.snippets) < 20:
             session.snippets.append(context.payload_preview)
+        visible_details = {key: value for key, value in context.protocol_details.items() if not str(key).startswith("_")}
+        if visible_details:
+            merged = dict(session.protocol_details.get(context.category, {}))
+            merged.update(visible_details)
+            session.protocol_details[context.category] = merged
+            session.last_protocol_detail = f"{context.category}: {', '.join(f'{key}={value}' for key, value in merged.items() if value)[:180]}"
 
-        if context.http_url and FILE_HINT_RE.search(context.http_url):
-            self._extract_http_artifact(context)
-            session.extracted_artifact = context.http_url
+        payload = payload_override or b""
+        if not payload and packet is not None and Raw is not None and packet.haslayer(Raw):
+            payload = bytes(packet[Raw].load[: self.config.stream_file_chunk_bytes])
+
+        role = self._stream_role(session, context)
+        context.stream_direction = role
+        if payload:
+            reassembled = self._reassemble_tcp_payload(session, context, role, payload)
+            if context.transport != "TCP":
+                reassembled = payload
+            if reassembled:
+                self._append_stream_chunk(session, role, reassembled)
+                self._continue_pending_artifact(session, role, reassembled, context.timestamp)
+                self._update_http_reconstruction(session, context, reassembled, role)
+                self._update_ftp_reconstruction(session, context, reassembled, role)
+
+        if context.http_url:
+            session.last_request_url = context.http_url
+        if context.http_status:
+            session.last_http_status = context.http_status
+        session.conversation_summary = self._build_conversation_summary(session)
 
     def _extract_http_artifact(self, context: PacketContext) -> None:
         artifact_dir = Path(self.config.artifact_dir)
@@ -912,6 +2163,381 @@ class ThreatPlatform:
             f"Potential file transfer observed\nHost: {context.src_ip}\nDestination: {context.dst_ip}\nURL: {context.http_url}\n",
             encoding="utf-8",
         )
+
+    def _sequence_token(self, context: PacketContext) -> str:
+        port = context.dst_port if context.direction != "inbound" else context.src_port
+        service = SERVICE_PORT_LABELS.get(port)
+        if not service:
+            if port <= 0:
+                service = "unknown"
+            elif port < 1024:
+                service = f"priv-{port}"
+            elif port < 49152:
+                service = "registered"
+            else:
+                service = "ephemeral"
+        token = f"{context.direction}:{context.category.lower()}:{service}"
+        if context.http_method:
+            token = f"{token}:{context.http_method.upper()}"
+        return token
+
+    def _stream_role(self, session: SessionRecord, context: PacketContext) -> str:
+        if (context.src_ip, context.src_port) == (session.src_ip, session.src_port):
+            return "client"
+        return "server"
+
+    def _stream_file_path(self, session: SessionRecord, role: str) -> Path:
+        safe_id = safe_path_fragment(session.session_id)
+        suffix = "c2s" if role == "client" else "s2c"
+        return Path(self.config.session_dir) / f"{safe_id}-{suffix}.bin"
+
+    def _reassemble_tcp_payload(
+        self,
+        session: SessionRecord,
+        context: PacketContext,
+        role: str,
+        payload: bytes,
+    ) -> bytes:
+        if context.transport != "TCP":
+            return payload
+        state = self.reassembly_buffers[(session.session_id, role)]
+        data_seq = context.tcp_seq + (1 if context.tcp_flags & 0x02 else 0)
+        if state.next_seq is None:
+            state.next_seq = data_seq
+        if not payload:
+            if context.tcp_flags & 0x02 and state.next_seq == data_seq:
+                state.next_seq = data_seq
+            self._snapshot_reassembly_state(session, role, state)
+            return b""
+        if data_seq > (state.next_seq or data_seq):
+            state.out_of_order += 1
+        if data_seq < (state.next_seq or data_seq):
+            overlap = (state.next_seq or data_seq) - data_seq
+            if overlap >= len(payload):
+                state.overlaps += 1
+                self._snapshot_reassembly_state(session, role, state)
+                return b""
+            payload = payload[overlap:]
+            data_seq = state.next_seq or data_seq
+            state.overlaps += 1
+
+        existing = state.fragments.get(data_seq)
+        if existing is None or len(payload) > len(existing):
+            state.fragments[data_seq] = payload
+        else:
+            state.overlaps += 1
+
+        if len(state.fragments) > self.config.reassembly_max_fragments:
+            for sequence in sorted(state.fragments)[: max(1, len(state.fragments) - self.config.reassembly_max_fragments)]:
+                if sequence != state.next_seq:
+                    state.fragments.pop(sequence, None)
+
+        contiguous = bytearray()
+        while state.next_seq is not None and state.next_seq in state.fragments:
+            chunk = state.fragments.pop(state.next_seq)
+            contiguous.extend(chunk)
+            state.next_seq += len(chunk)
+            state.contiguous_bytes += len(chunk)
+
+        self._snapshot_reassembly_state(session, role, state)
+        return bytes(contiguous)
+
+    def _snapshot_reassembly_state(self, session: SessionRecord, role: str, state: ReassemblyBuffer) -> None:
+        session.reassembly[role] = {
+            "next_seq": state.next_seq or 0,
+            "buffered_fragments": len(state.fragments),
+            "out_of_order": state.out_of_order,
+            "overlaps": state.overlaps,
+            "contiguous_bytes": state.contiguous_bytes,
+        }
+
+    def _append_stream_chunk(self, session: SessionRecord, role: str, payload: bytes) -> None:
+        path = self._stream_file_path(session, role)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("ab") as handle:
+            handle.write(payload)
+
+        preview_text = safe_decode(payload).replace("\r", " ").replace("\n", " ").strip()
+        if role == "client":
+            session.client_payload_bytes += len(payload)
+            session.client_stream_path = str(path)
+            combined = f"{session.reconstructed_client_preview} {preview_text}".strip()
+            session.reconstructed_client_preview = combined[-self.config.stream_preview_chars:]
+        else:
+            session.server_payload_bytes += len(payload)
+            session.server_stream_path = str(path)
+            combined = f"{session.reconstructed_server_preview} {preview_text}".strip()
+            session.reconstructed_server_preview = combined[-self.config.stream_preview_chars:]
+
+    def _update_http_reconstruction(self, session: SessionRecord, context: PacketContext, payload: bytes, role: str) -> None:
+        http_info = parse_http_payload(payload)
+        if not http_info.get("is_http"):
+            return
+
+        if http_info.get("is_response"):
+            session.response_count += 1
+            session.last_http_status = str(http_info.get("status", "")) or session.last_http_status
+            self._start_response_artifact(session, context, payload, http_info, role)
+            return
+
+        session.request_count += 1
+        session.last_request_url = str(http_info.get("url", "")) or session.last_request_url
+        if FILE_HINT_RE.search(session.last_request_url):
+            self._record_artifact_hint(session, context)
+
+    def _update_ftp_reconstruction(self, session: SessionRecord, context: PacketContext, payload: bytes, role: str) -> None:
+        if context.category != "FTP":
+            return
+        ftp_info = parse_ftp_payload(payload)
+        if not ftp_info:
+            ftp_info = context.protocol_details
+        if not ftp_info:
+            self._append_ftp_transfer_chunk(session, context, payload)
+            return
+        if ftp_info.get("command"):
+            session.request_count += 1
+            session.last_protocol_detail = f"FTP: {ftp_info.get('command')} {ftp_info.get('argument', '')}".strip()
+        if ftp_info.get("status_code"):
+            session.response_count += 1
+        file_name = str(ftp_info.get("file_name", "") or "")
+        command = str(ftp_info.get("command", "") or "")
+        if file_name and command in {"RETR", "STOR", "RNFR", "RNTO"}:
+            self._record_ftp_artifact_hint(session, context, file_name, "complete")
+        if file_name and command in {"RETR", "STOR"} and role == "client":
+            self._remember_ftp_transfer(session, context, file_name, command)
+        if not ftp_info.get("command") and not ftp_info.get("status_code"):
+            self._append_ftp_transfer_chunk(session, context, payload)
+
+    def _record_artifact_hint(self, session: SessionRecord, context: PacketContext) -> None:
+        self._extract_http_artifact(context)
+        candidate = {
+            "timestamp": context.timestamp,
+            "file_name": Path(urlparse(context.http_url).path).name or "download.bin",
+            "file_path": "",
+            "content_type": "",
+            "source_url": context.http_url,
+            "bytes_written": 0,
+            "status": "hint",
+        }
+        self._merge_artifact(session, candidate)
+        session.extracted_artifact = context.http_url
+
+    def _record_ftp_artifact_hint(self, session: SessionRecord, context: PacketContext, file_name: str, operation: str) -> None:
+        candidate = {
+            "timestamp": context.timestamp,
+            "file_name": safe_path_fragment(file_name or "ftp-transfer.bin"),
+            "file_path": "",
+            "content_type": "application/octet-stream",
+            "source_url": f"ftp://{context.hostname or context.dst_ip}/{safe_path_fragment(file_name or 'ftp-transfer.bin')}",
+            "bytes_written": 0,
+            "status": operation.lower(),
+            "protocol": "FTP",
+        }
+        self._merge_artifact(session, candidate)
+        session.extracted_artifact = candidate["source_url"]
+
+    def _remember_ftp_transfer(self, session: SessionRecord, context: PacketContext, file_name: str, command: str) -> None:
+        artifact_dir = Path(self.config.artifact_dir)
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = safe_path_fragment(file_name or "ftp-transfer.bin")
+        pair_key = tuple(sorted((context.src_ip, context.dst_ip)))
+        if pair_key in self.pending_ftp_transfers and self.pending_ftp_transfers[pair_key].get("file_name") != safe_name:
+            self.pending_ftp_transfers.pop(pair_key, None)
+        artifact_path = artifact_dir / f"ftp-{safe_path_fragment(session.session_id)}-{safe_name}"
+        if artifact_path.exists():
+            artifact_path = artifact_dir / f"ftp-{int(context.timestamp)}-{safe_path_fragment(session.session_id)}-{safe_name}"
+        operation = "download" if command == "RETR" else "upload"
+        self.pending_ftp_transfers[pair_key] = {
+            "file_name": safe_name,
+            "path": str(artifact_path),
+            "source_url": f"ftp://{context.hostname or context.dst_ip}/{safe_name}",
+            "operation": operation,
+            "timestamp": context.timestamp,
+            "bytes_written": 0,
+        }
+
+    def _append_ftp_transfer_chunk(self, session: SessionRecord, context: PacketContext, payload: bytes) -> None:
+        if not payload:
+            return
+        pair_key = tuple(sorted((context.src_ip, context.dst_ip)))
+        transfer = self.pending_ftp_transfers.get(pair_key)
+        if not transfer:
+            return
+        if context.timestamp - float(transfer.get("timestamp", 0)) > FTP_TRANSFER_TIMEOUT:
+            self.pending_ftp_transfers.pop(pair_key, None)
+            return
+
+        path = Path(str(transfer["path"]))
+        remaining = max(0, self.config.artifact_max_bytes - int(transfer.get("bytes_written", 0)))
+        if remaining <= 0:
+            self.pending_ftp_transfers.pop(pair_key, None)
+            return
+        chunk = payload[:remaining]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("ab") as handle:
+            handle.write(chunk)
+
+        transfer["timestamp"] = context.timestamp
+        transfer["bytes_written"] = int(transfer.get("bytes_written", 0)) + len(chunk)
+        complete = bool(context.tcp_flags & 0x01 or context.tcp_flags & 0x04) or transfer["bytes_written"] >= self.config.artifact_max_bytes
+        self._merge_artifact(
+            session,
+            {
+                "timestamp": context.timestamp,
+                "file_name": str(transfer["file_name"]),
+                "file_path": str(path),
+                "content_type": "application/octet-stream",
+                "source_url": str(transfer["source_url"]),
+                "bytes_written": int(transfer["bytes_written"]),
+                "status": "complete" if complete else "extracting",
+                "protocol": "FTP",
+                "operation": str(transfer.get("operation", "transfer")),
+            },
+        )
+        session.extracted_artifact = str(path)
+        if complete:
+            self.pending_ftp_transfers.pop(pair_key, None)
+
+    def _merge_artifact(self, session: SessionRecord, artifact: Dict[str, object]) -> None:
+        for existing in session.artifacts:
+            if existing.get("file_path") and existing.get("file_path") == artifact.get("file_path"):
+                existing.update(artifact)
+                return
+            if existing.get("source_url") and existing.get("source_url") == artifact.get("source_url") and existing.get("file_name") == artifact.get("file_name"):
+                existing.update(artifact)
+                return
+        session.artifacts.append(artifact)
+
+    def _split_http_body(self, payload: bytes) -> Tuple[bytes, bytes]:
+        for separator in (b"\r\n\r\n", b"\n\n"):
+            if separator in payload:
+                return payload.split(separator, 1)
+        return payload, b""
+
+    def _guess_artifact_filename(
+        self,
+        session: SessionRecord,
+        context: PacketContext,
+        headers: Dict[str, str],
+    ) -> str:
+        disposition = headers.get("content-disposition", "")
+        match = re.search(r'filename="?([^";]+)"?', disposition, re.IGNORECASE)
+        if match:
+            return safe_path_fragment(match.group(1))
+        url_candidate = session.last_request_url or context.http_url
+        if url_candidate:
+            name = Path(urlparse(url_candidate).path).name
+            if name:
+                return safe_path_fragment(name)
+        content_type = headers.get("content-type", "") or context.http_content_type
+        extension = ".bin"
+        if "pdf" in content_type:
+            extension = ".pdf"
+        elif "zip" in content_type:
+            extension = ".zip"
+        elif "json" in content_type:
+            extension = ".json"
+        elif "html" in content_type:
+            extension = ".html"
+        return f"{safe_path_fragment(session.session_id)}{extension}"
+
+    def _start_response_artifact(
+        self,
+        session: SessionRecord,
+        context: PacketContext,
+        payload: bytes,
+        http_info: Dict[str, object],
+        role: str,
+    ) -> None:
+        if role != "server":
+            return
+        headers = {str(key).lower(): str(value) for key, value in dict(http_info.get("headers", {})).items()}
+        content_type = headers.get("content-type", "")
+        disposition = headers.get("content-disposition", "")
+        interesting = disposition or any(content_type.lower().startswith(prefix) for prefix in DOWNLOAD_CONTENT_TYPES)
+        if not interesting and not FILE_HINT_RE.search(session.last_request_url or context.http_url):
+            return
+
+        _, body = self._split_http_body(payload)
+        artifact_name = self._guess_artifact_filename(session, context, headers)
+        path = Path(self.config.artifact_dir) / artifact_name
+        if path.exists():
+            path = Path(self.config.artifact_dir) / f"{safe_path_fragment(session.session_id)}-{artifact_name}"
+        max_bytes = self.config.artifact_max_bytes
+        body = body[:max_bytes]
+        with path.open("wb") as handle:
+            handle.write(body)
+
+        content_length = headers.get("content-length", "")
+        remaining = 0
+        try:
+            total_expected = int(content_length)
+            remaining = max(0, total_expected - len(body))
+        except Exception:
+            remaining = 0
+
+        artifact = {
+            "timestamp": context.timestamp,
+            "file_name": path.name,
+            "file_path": str(path),
+            "content_type": content_type,
+            "source_url": session.last_request_url or context.http_url,
+            "bytes_written": len(body),
+            "status": "extracting" if remaining > 0 else "complete",
+        }
+        self._merge_artifact(session, artifact)
+        session.extracted_artifact = str(path)
+        if remaining > 0:
+            self.pending_artifacts[session.session_id] = {
+                "path": str(path),
+                "remaining": remaining,
+                "role": role,
+                "bytes_written": len(body),
+                "timestamp": context.timestamp,
+            }
+
+    def _continue_pending_artifact(self, session: SessionRecord, role: str, payload: bytes, timestamp: float) -> None:
+        pending = self.pending_artifacts.get(session.session_id)
+        if not pending or pending.get("role") != role:
+            return
+        if pending["remaining"] <= 0:
+            self.pending_artifacts.pop(session.session_id, None)
+            return
+        chunk = payload[: min(len(payload), int(pending["remaining"]), self.config.artifact_max_bytes)]
+        if not chunk:
+            return
+        path = Path(str(pending["path"]))
+        with path.open("ab") as handle:
+            handle.write(chunk)
+        pending["remaining"] = max(0, int(pending["remaining"]) - len(chunk))
+        pending["bytes_written"] = int(pending["bytes_written"]) + len(chunk)
+        status = "complete" if pending["remaining"] <= 0 else "extracting"
+        self._merge_artifact(
+            session,
+            {
+                "timestamp": timestamp,
+                "file_name": path.name,
+                "file_path": str(path),
+                "bytes_written": pending["bytes_written"],
+                "status": status,
+            },
+        )
+        if pending["remaining"] <= 0:
+            self.pending_artifacts.pop(session.session_id, None)
+
+    def _build_conversation_summary(self, session: SessionRecord) -> str:
+        parts = []
+        if session.last_request_url:
+            parts.append(f"request {session.last_request_url}")
+        if session.last_http_status:
+            parts.append(f"response {session.last_http_status}")
+        if session.last_protocol_detail:
+            parts.append(session.last_protocol_detail)
+        if session.artifacts:
+            parts.append(f"artifacts {len(session.artifacts)}")
+        if not parts:
+            parts.append(f"{session.packet_count} packets")
+        return " | ".join(parts)
 
     def _update_reputation(self, context: PacketContext, state: HostState) -> None:
         risk = 0
@@ -1470,28 +3096,116 @@ class ThreatPlatform:
             )
         return findings
 
+    def _detect_sequence_anomaly(self, state: HostState, context: PacketContext) -> List[DetectionFinding]:
+        if not self.config.sequence_model_enabled or not state.snapshot.baseline_ready:
+            return []
+        transition = dict(context.protocol_details.get("_sequence_transition", {}) or {})
+        previous = str(transition.get("previous") or "")
+        current = str(transition.get("current") or "")
+        previous_total = int(transition.get("previous_total") or 0)
+        pair_seen = int(transition.get("pair_seen") or 0)
+        if not previous or not current or previous_total < self.config.sequence_min_transitions:
+            return []
+
+        probability = (pair_seen / previous_total) if previous_total else 0.0
+        benign_web = (
+            context.trusted
+            and context.category in {"HTTP", "HTTPS", "TLS", "DNS"}
+            and context.dst_port in KNOWN_SERVICE_PORTS
+        )
+        if pair_seen > 0 and probability >= self.config.sequence_probability_floor:
+            return []
+        if benign_web and pair_seen > 0:
+            return []
+
+        severity = "MEDIUM" if (not context.trusted or context.ioc_matches or context.dst_port not in KNOWN_SERVICE_PORTS) else "LOW"
+        score_delta = 3 if severity == "MEDIUM" else 1
+        return [
+            DetectionFinding(
+                title="Sequence anomaly model deviation",
+                severity=severity,
+                classification="Machine learning anomaly",
+                score_delta=score_delta,
+                reasons=[
+                    f"Learned sequence model rarely transitions from {previous} to {current}.",
+                    f"Observed transition frequency was {pair_seen}/{previous_total} ({probability:.3f}) for the host baseline.",
+                ],
+                action="Review the surrounding session, recent destinations, and companion detections to validate whether the communication pattern is expected.",
+                mitre_technique="T1071",
+                mitre_tactic="Command and Control",
+                dedupe_key=f"ml-sequence:{context.src_ip}:{previous}:{current}",
+                cooldown=900,
+            )
+        ]
+
+    def _detect_lstm_sequence_anomaly(self, state: HostState, context: PacketContext) -> List[DetectionFinding]:
+        if not self.config.lstm_enabled or not state.snapshot.baseline_ready:
+            return []
+        prediction = dict(context.protocol_details.get("_lstm_prediction", {}) or {})
+        if not prediction:
+            return []
+        probability = float(prediction.get("probability") or 1.0)
+        token = str(prediction.get("token") or "")
+        if probability >= self.config.lstm_anomaly_threshold:
+            return []
+        if context.trusted and context.dst_port in KNOWN_SERVICE_PORTS and not context.ioc_matches:
+            return []
+        severity = "HIGH" if context.ioc_matches or context.dst_port not in KNOWN_SERVICE_PORTS else "MEDIUM"
+        return [
+            DetectionFinding(
+                title="LSTM sequence anomaly",
+                severity=severity,
+                classification="Machine learning anomaly",
+                score_delta=5 if severity == "HIGH" else 3,
+                reasons=[
+                    f"TensorFlow/Keras LSTM model assigned probability {probability:.4f} to sequence token {token}.",
+                    f"The configured anomaly threshold is {self.config.lstm_anomaly_threshold:.4f}.",
+                ],
+                action="Pivot into the reconstructed session and compare this host sequence against known application behavior.",
+                mitre_technique="T1071",
+                mitre_tactic="Command and Control",
+                dedupe_key=f"ml-lstm:{context.src_ip}:{token}",
+                cooldown=900,
+            )
+        ]
+
     def _detect_ml_anomaly(self, state: HostState, context: PacketContext) -> List[DetectionFinding]:
-        if IsolationForest is None or len(self.ml_features) < 200:
+        trusted_destination = any(keyword in (context.hostname or "").lower() for keyword in TRUSTED_HOST_KEYWORDS)
+        standard_port = context.dst_port in {
+            53, 80, 123, 443, 445, 636, 8443, 3389, 5222, 5223, 5228, 8080, 8883,
+        }
+        if (
+            not self.config.ml_enabled
+            or IsolationForest is None
+            or len(self.ml_features) < self.config.ml_min_global_samples
+            or not state.snapshot.baseline_ready
+            or len(state.feature_samples) < self.config.ml_min_host_samples
+            or context.private_pair
+        ):
+            return []
+        if trusted_destination and standard_port and context.category in {"TCP", "UDP", "HTTP", "HTTPS", "TLS"}:
             return []
         if self.ml_model is None or len(self.ml_features) - self.ml_last_train_count >= 100:
-            self.ml_model = IsolationForest(contamination=0.02, random_state=42)
+            self.ml_model = IsolationForest(contamination=0.015, random_state=42)
             self.ml_model.fit(list(self.ml_features))
             self.ml_last_train_count = len(self.ml_features)
         sample = list(state.feature_samples)[-1] if state.feature_samples else None
         if sample is None:
             return []
         prediction = int(self.ml_model.predict([sample])[0])
-        if prediction != -1:
+        anomaly_score = float(self.ml_model.decision_function([sample])[0])
+        suspicious_port = not standard_port
+        if prediction != -1 or anomaly_score > -0.08 or (trusted_destination and not suspicious_port):
             return []
         return [
             DetectionFinding(
                 title="ML traffic outlier",
-                severity="MEDIUM",
+                severity="LOW" if suspicious_port else "MEDIUM",
                 classification="Machine learning anomaly",
-                score_delta=4,
+                score_delta=2 if suspicious_port else 1,
                 reasons=[
-                    "Isolation Forest marked the latest packet feature vector as an outlier against learned traffic patterns.",
-                    f"Features: size={context.packet_len}, port={context.dst_port}, ttl={context.ttl}.",
+                    "Isolation Forest marked the latest packet feature vector as a low-frequency deviation against learned traffic patterns.",
+                    f"Features: size={context.packet_len}, port={context.dst_port}, ttl={context.ttl}, interarrival={sample[5]:.3f}, packet_rate={sample[6]:.2f}/s, anomaly_score={anomaly_score:.3f}.",
                 ],
                 action="Use supporting detections and baseline context to determine whether the outlier is benign or malicious.",
                 mitre_technique="T1001",
@@ -1503,7 +3217,41 @@ class ThreatPlatform:
 
     def _detect_protocol_activity(self, context: PacketContext) -> List[DetectionFinding]:
         findings: List[DetectionFinding] = []
-        if context.category == "SMB" and "NTLMSSP" in context.payload_preview.upper():
+        ftp_details = context.protocol_details if context.category == "FTP" else {}
+        if context.category == "FTP" and ftp_details.get("command") == "STOR":
+            findings.append(
+                DetectionFinding(
+                    title="FTP upload command observed",
+                    severity="MEDIUM",
+                    classification="Protocol dissection",
+                    score_delta=2,
+                    reasons=[f"FTP STOR targeted {ftp_details.get('file_name') or ftp_details.get('argument') or 'a remote file'}."],
+                    action="Validate whether plaintext FTP uploads are expected and review the transferred artifact.",
+                    mitre_technique="T1048",
+                    mitre_tactic="Exfiltration",
+                    dedupe_key=f"ftp-stor:{context.session_id}:{ftp_details.get('file_name', '')}",
+                    cooldown=1800,
+                )
+            )
+        if context.category == "FTP" and ftp_details.get("command") == "RETR":
+            findings.append(
+                DetectionFinding(
+                    title="FTP retrieval command observed",
+                    severity="LOW",
+                    classification="Protocol dissection",
+                    score_delta=1,
+                    reasons=[f"FTP RETR requested {ftp_details.get('file_name') or ftp_details.get('argument') or 'a remote file'}."],
+                    action="Use this as transfer context while investigating staging or tool retrieval.",
+                    mitre_technique="T1105",
+                    mitre_tactic="Command and Control",
+                    dedupe_key=f"ftp-retr:{context.session_id}:{ftp_details.get('file_name', '')}",
+                    cooldown=1800,
+                )
+            )
+        smb_details = context.protocol_details if context.category == "SMB" else {}
+        if context.category == "SMB" and (
+            "NTLMSSP" in context.payload_preview.upper() or smb_details.get("auth") == "NTLMSSP"
+        ):
             findings.append(
                 DetectionFinding(
                     title="SMB authentication exchange observed",
@@ -1518,7 +3266,25 @@ class ThreatPlatform:
                     cooldown=1200,
                 )
             )
-        if context.category == "RDP" and "COOKIE: MSTSHASH" in context.payload_preview.upper():
+        if context.category == "SMB" and smb_details.get("shares"):
+            findings.append(
+                DetectionFinding(
+                    title="SMB share access observed",
+                    severity="LOW",
+                    classification="Protocol dissection",
+                    score_delta=1,
+                    reasons=[f"SMB referenced share paths: {', '.join(smb_details.get('shares', [])[:3])}."],
+                    action="Use this as asset and file-share context while investigating lateral movement or staging.",
+                    mitre_technique="T1021",
+                    mitre_tactic="Lateral Movement",
+                    dedupe_key=f"smb-share:{context.session_id}",
+                    cooldown=1800,
+                )
+            )
+        rdp_details = context.protocol_details if context.category == "RDP" else {}
+        if context.category == "RDP" and (
+            "COOKIE: MSTSHASH" in context.payload_preview.upper() or rdp_details.get("stage") == "client-negotiation"
+        ):
             findings.append(
                 DetectionFinding(
                     title="RDP client negotiation observed",
@@ -1533,6 +3299,53 @@ class ThreatPlatform:
                     cooldown=1200,
                 )
             )
+        if context.category == "RDP" and rdp_details.get("virtual_channels"):
+            findings.append(
+                DetectionFinding(
+                    title="RDP virtual channels observed",
+                    severity="LOW",
+                    classification="Protocol dissection",
+                    score_delta=1,
+                    reasons=[f"RDP virtual channels included {', '.join(rdp_details.get('virtual_channels', []))}."],
+                    action="Use this to understand remote session capabilities during a host investigation.",
+                    mitre_technique="T1021",
+                    mitre_tactic="Lateral Movement",
+                    dedupe_key=f"rdp-channels:{context.session_id}",
+                    cooldown=1800,
+                )
+            )
+        ldap_details = context.protocol_details if context.category == "LDAP" else {}
+        if context.category == "LDAP" and ldap_details.get("simple_bind"):
+            findings.append(
+                DetectionFinding(
+                    title="LDAP simple bind observed",
+                    severity="MEDIUM",
+                    classification="Protocol dissection",
+                    score_delta=3,
+                    reasons=["LDAP payload markers suggest a simple bind, which may expose credentials on plaintext LDAP."],
+                    action="Prefer LDAPS where possible and validate whether this bind was expected for the client and directory service.",
+                    mitre_technique="T1557",
+                    mitre_tactic="Credential Access",
+                    dedupe_key=f"ldap-simple-bind:{context.session_id}",
+                    cooldown=1800,
+                )
+            )
+        if context.category == "LDAP" and ldap_details.get("distinguished_names"):
+            findings.append(
+                DetectionFinding(
+                    title="LDAP directory query context observed",
+                    severity="LOW",
+                    classification="Protocol dissection",
+                    score_delta=1,
+                    reasons=[f"LDAP referenced {', '.join(ldap_details.get('distinguished_names', [])[:2])}."],
+                    action="Use this DN context while reviewing authentication, enumeration, or directory reconnaissance activity.",
+                    mitre_technique="T1087",
+                    mitre_tactic="Discovery",
+                    dedupe_key=f"ldap-dn:{context.session_id}",
+                    cooldown=1800,
+                )
+            )
+        kerberos_details = context.protocol_details if context.category == "KERBEROS" else {}
         if context.category == "KERBEROS":
             findings.append(
                 DetectionFinding(
@@ -1540,11 +3353,29 @@ class ThreatPlatform:
                     severity="LOW",
                     classification="Protocol dissection",
                     score_delta=1,
-                    reasons=["Kerberos traffic was observed, which can be useful context during identity investigations."],
+                    reasons=[
+                        "Kerberos traffic was observed, which can be useful context during identity investigations.",
+                        kerberos_details.get("message_type", "Kerberos message type not parsed."),
+                    ],
                     action="Correlate with authentication telemetry if the host later triggers credential-focused alerts.",
                     mitre_technique="T1558",
                     mitre_tactic="Credential Access",
                     dedupe_key=f"kerberos:{context.session_id}",
+                    cooldown=1800,
+                )
+            )
+        if context.category == "KERBEROS" and kerberos_details.get("service_principals"):
+            findings.append(
+                DetectionFinding(
+                    title="Kerberos service principal observed",
+                    severity="LOW",
+                    classification="Protocol dissection",
+                    score_delta=1,
+                    reasons=[f"Kerberos referenced {', '.join(kerberos_details.get('service_principals', [])[:3])}."],
+                    action="Use the SPN context to understand which services the client attempted to access.",
+                    mitre_technique="T1558",
+                    mitre_tactic="Credential Access",
+                    dedupe_key=f"kerberos-spn:{context.session_id}",
                     cooldown=1800,
                 )
             )
@@ -1612,6 +3443,9 @@ class ThreatPlatform:
             "protocols": state.baseline_protocols.most_common(20),
             "score": state.snapshot.score,
             "reputation_score": state.snapshot.reputation_score,
+            "packet_count": state.snapshot.packet_count,
+            "outbound_bytes": state.snapshot.outbound_bytes,
+            "last_finding": state.snapshot.last_finding,
         }
         self.store.upsert_baseline(state.snapshot.ip, timestamp, payload)
 
@@ -1636,3 +3470,5 @@ class ThreatPlatform:
         if SEVERITY_ORDER.get(preferred, 0) > SEVERITY_ORDER.get(derived, 0):
             return preferred
         return derived
+
+

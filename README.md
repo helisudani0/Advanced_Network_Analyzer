@@ -31,28 +31,6 @@ dist/checksums.txt
 
 The Windows ZIP includes the GUI launcher, analyzer engine, profiles, feeds, requirements, and first-run setup notes.
 
-## Deploy Product Site On GitHub
-
-GitHub Actions includes:
-
-```text
-.github/workflows/pages.yml
-.github/workflows/release.yml
-```
-
-Recommended release flow:
-
-```powershell
-git tag v0.1.0
-git push origin main --tags
-```
-
-The release workflow uploads downloadable assets to GitHub Releases. The product site download buttons point to:
-
-```text
-https://github.com/<owner>/<repo>/releases/latest/download/<asset-name>
-```
-
 ## Windows First Run
 
 1. Install Python 3.12+.

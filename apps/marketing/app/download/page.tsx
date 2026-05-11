@@ -1,6 +1,6 @@
 const releaseBaseUrl =
   process.env.NEXT_PUBLIC_DOWNLOAD_BASE_URL ||
-  "https://github.com/helisudani0/Ravynel-Security/releases/latest/download";
+  "https://github.com/helisudani0/Network_Analyzer/releases/latest/download";
 
 const assetUrl = (file: string) => `${releaseBaseUrl.replace(/\/$/, "")}/${file}`;
 
@@ -92,3 +92,4 @@ export default function DownloadPage() {
     </main>
   );
 }
+

@@ -1,5 +1,5 @@
 /** @type {import('next').NextConfig} */
-const repoName = process.env.GITHUB_REPOSITORY?.split('/')[1] || 'Ravynel-Security';
+const repoName = process.env.GITHUB_REPOSITORY?.split('/')[1] || 'Network_Analyzer';
 const isGitHubPages = process.env.GITHUB_PAGES === 'true';
 const configuredBasePath = process.env.NEXT_PUBLIC_SITE_BASE_PATH || '';
 const basePath = configuredBasePath || (isGitHubPages ? `/${repoName}` : '');
@@ -16,3 +16,4 @@ const nextConfig = {
 };
 
 export default nextConfig;
+

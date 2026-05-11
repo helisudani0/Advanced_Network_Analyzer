@@ -1,0 +1,42 @@
+﻿__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.exe
+
+analyzer.db
+app_settings.json
+reports/
+downloads/
+uploads/
+data/
+
+# Rust / Go build output
+target/
+bin/
+coverage.out
+
+# local validation scratch
+temp_*.db
+temp_*.json
+temp_*/
+.tmp_*/
+
+.pytest_cache/
+# JavaScript / Next.js
+node_modules/
+.next/
+apps/*/.next/
+apps/*/out/
+
+# local package manager and build caches
+.tmp_npm_cache/
+.tmp_go_cache/
+.tmp_go_mod/
+.tmp_gopath/
+
+# TypeScript incremental state
+*.tsbuildinfo
+logs/
+
+

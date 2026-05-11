@@ -1,74 +1,83 @@
-# Advanced Explainable Network Threat Analyzer
+# Ravynel Security Launch Guide
 
-## Overview
+Ravynel Security is a live network threat detection platform for packet capture, protocol analysis, host/session visibility, alert triage, asset baselining, and PDF investigation reporting.
 
-This project is a Python-based, SOC-style network traffic analyzer designed to monitor live network activity and identify potentially malicious behavior in an explainable and context-aware manner. Unlike basic packet sniffers, the analyzer focuses on reducing false positives while providing clear, human-readable explanations for detected threats.
+Developed by: [HeliSudani](https://helisudani0.github.io/Heli_Sudani-Portfolio/)
 
-The tool passively inspects network traffic and classifies DNS, mDNS, HTTP/HTTPS, and general packet behavior, applying intelligent risk scoring and suppression logic similar to commercial intrusion detection systems.
+## Product Surfaces
 
-## Key Features
+| Surface | Purpose | Default URL |
+| --- | --- | --- |
+| Product site | Public overview, docs, release notes, support, and downloads | `http://localhost:3000` during website development |
+| Ravynel app | Installed/local analyst console for live capture, detections, assets, reports, and settings | Opened automatically by the launcher |
 
-* Live packet capture using Scapy
-* DNS and mDNS query identification and classification
-* HTTP and HTTPS traffic awareness
-* Context-aware traffic burst and flood detection
-* Private IP and cloud service traffic suppression
-* Risk scoring with automatic score decay over time
-* Explainable threat labeling for analyst-friendly output
-* Low false-positive design
-* Passive analysis only (no packet injection or attacks)
+The product site is not required to use the app. Downloaded users launch the Ravynel app directly.
 
-## Technology Stack
+## Start The App
 
-* Language: Python
-* Library: Scapy
-* Environment: Windows / Linux (Administrator or sudo required)
+```powershell
+.\scripts\start-ravynel.ps1
+```
 
-## How It Works
+The launcher chooses a free local API port, starts the analyzer in the background, waits for it to become ready, and opens the clean app GUI in your browser. Logs are written to `logs/app.out.log` and `logs/app.err.log`.
 
-1. Captures live network packets from the active network interface.
-2. Maintains time-based traffic windows per source IP.
-3. Classifies traffic types such as DNS, mDNS, and HTTP/HTTPS.
-4. Detects anomalous behavior based on packet frequency and patterns.
-5. Applies contextual rules to ignore:
-   * Internal/private IP addresses
-   * Outbound client traffic to cloud and CDN services
-6. Assigns and updates threat scores only when behavior exceeds realistic thresholds.
-7. Generates analyst-readable alerts with clear explanations.
+If you need to see logs immediately:
 
-## Example Output
+```powershell
+.\scripts\start-ravynel.ps1 -ShowLogs
+```
 
-The analyzer provides structured console output, including:
+Manual terminal launch:
 
-* DNS queries and destination domains
-* Local service discovery traffic (mDNS)
-* HTTP/HTTPS request destinations
-* Risk level, threat description, reasoning, and score when anomalies are detected
+```powershell
+python app.py dashboard
+```
 
-This makes the output understandable even for non-specialists reviewing network activity.
+## Start The Product Site For Development
 
-## Installation
+```powershell
+npm run dev:site
+```
 
-Install the required dependency: pip install scapy
+Open:
 
-## How to run
+```text
+http://localhost:3000
+```
 
-Run the script with administrative privileges: python app.py
+## Live Packet Capture
 
-(On Windows, run Command Prompt as Administrator.
-On Linux, use sudo.)
+You do not type an IP range for live packet capture. Ravynel monitors the selected local adapter or the default packet-capture adapter.
 
-## Limitations
+Examples:
 
-* Passive monitoring only (no active defense or blocking)
-* Not intended to replace full IDS/IPS solutions
-* Designed for learning purposes
+```powershell
+python app.py dashboard
+python app.py dashboard --iface Ethernet
+python app.py dashboard --iface Wi-Fi --bpf-filter "tcp or udp"
+```
 
-## Ethical Notice
+A normal laptop Wi-Fi/Ethernet adapter sees traffic visible to that adapter. For full enterprise LAN visibility, deploy a gateway sensor, SPAN/TAP capture point, or distributed Ravynel sensors.
 
-This tool performs passive traffic analysis only. It does not generate malicious traffic, exploit systems, or perform unauthorized actions. It is intended strictly for learning and defensive security research.
+## Reports
 
-## Author- Heli Sudani
+Reports are generated from real captured or replayed telemetry and saved as PDFs in `reports/`.
 
-Developed as part of an advanced hands-on cybersecurity and IT learning project.
+```powershell
+python app.py report
+```
 
+## Validation
+
+```powershell
+npm run typecheck
+npm run build:site
+cargo test
+$env:GOCACHE=(Resolve-Path .).Path + '\.tmp_go_cache'; go test .\services\control-plane\...
+```
+
+## Notes
+
+- Ravynel displays observed telemetry only.
+- Normal traffic may produce packets, sessions, hosts, and assets without producing alerts.
+- Scan or capture only networks you own or are explicitly authorized to assess.
